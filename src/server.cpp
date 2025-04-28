@@ -47,13 +47,17 @@ bool send_message(int socket_fd, const std::string& message) {
 }
 
 // Bağlı istemcilerin listesini sunucu konsoluna yazdırır
+// Bağlı istemcilerin listesini sunucu konsoluna yazdırmak için fonksiyon
 void print_server_clients_list() {
-    std::lock_guard<std::mutex> lock(clients_mutex);
-    system("clear"); // Terminali temizle
-    std::cout << "--- Sunucu: Bağlı İstemciler ---" << std::endl;
+    // std::lock_guard<std::mutex> lock(clients_mutex); // << BU SATIRI SİLİN VEYA YORUM SATIRI YAPIN!
+    // Mutex zaten bu fonksiyonu çağıran yerde (handle_client içinde) kilitli.
+
+    // system("clear"); // İsteğe bağlı, sürekli temizlemek yerine alta ekleyebilir
+    std::cout << "\n--- Sunucu: Bağlı İstemciler ---" << std::endl; // Başına \n ekleyerek alta yazmasını sağlayalım
     if (clients_by_id.empty()) {
         std::cout << "(Şu an bağlı istemci yok)" << std::endl;
     } else {
+        // Mutex kilidi dışarıda alındığı için burada güvenle erişebiliriz
         for (const auto& pair : clients_by_id) {
             std::cout << "  - ID: " << pair.first
                       << ", IP: " << pair.second.ip_address
@@ -68,8 +72,6 @@ void print_server_clients_list() {
     std::cout << "---------------------------------" << std::endl;
     std::cout << "Yeni bağlantılar bekleniyor..." << std::endl;
 }
-
-
 // --- İstemci İşleme Mantığı ---
 void handle_client(int client_socket, std::string client_id) {
     char buffer[2048];
@@ -268,8 +270,33 @@ void handle_client(int client_socket, std::string client_id) {
 
 
 // --- Ana Sunucu Döngüsü ---
-int main() {
-    const int PORT = 12345;
+int main(int argc, char *argv[]) { // argc ve argv eklendi
+    // Varsayılan değerler
+    const char* DEFAULT_IP = "0.0.0.0"; // Tüm arayüzlerden dinle (localhost dahil)
+    int DEFAULT_PORT = 12345;
+
+    const char* listen_ip = DEFAULT_IP;
+    int listen_port = DEFAULT_PORT;
+
+    // Komut satırı argümanlarını kontrol et
+    if (argc == 3) {
+        listen_ip = argv[1];
+        try {
+            listen_port = std::stoi(argv[2]); // String'i integer'a çevir
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "Hata: Geçersiz port numarası: " << argv[2] << std::endl;
+            return 1;
+        } catch (const std::out_of_range& e) {
+             std::cerr << "Hata: Port numarası çok büyük: " << argv[2] << std::endl;
+            return 1;
+        }
+    } else if (argc != 1) { // Ya argüman yok ya da 2 tane olmalı
+        std::cerr << "Kullanım: " << argv[0] << " [dinlenecek_ip] [dinlenecek_port]" << std::endl;
+        std::cerr << "Örnek: " << argv[0] << " 0.0.0.0 12345" << std::endl;
+        std::cerr << "Argüman verilmezse varsayılan olarak " << DEFAULT_IP << ":" << DEFAULT_PORT << " kullanılır." << std::endl;
+        return 1;
+    }
+
     int server_fd;
     struct sockaddr_in address;
     int opt = 1;
@@ -281,19 +308,34 @@ int main() {
         perror("setsockopt hatası"); close(server_fd); exit(EXIT_FAILURE);
     }
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY; // Tüm IP'lerden dinle
-    address.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("Bağlama (bind) hatası"); close(server_fd); exit(EXIT_FAILURE);
+    // IP adresini ayarla (komut satırından veya varsayılan)
+    // inet_pton kullanmak inet_addr'dan daha modern ve IPv6 uyumludur.
+    if (inet_pton(AF_INET, listen_ip, &address.sin_addr) <= 0) {
+        std::cerr << "Hata: Geçersiz veya desteklenmeyen IP adresi: " << listen_ip << std::endl;
+        close(server_fd);
+        exit(EXIT_FAILURE);
     }
-    if (listen(server_fd, 10) < 0) { // Kuyruk boyutu artırıldı
+
+    // Portu ayarla (komut satırından veya varsayılan)
+    address.sin_port = htons(listen_port);
+
+    // Soketi IP ve Porta bağla
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Bağlama (bind) hatası");
+        std::cerr << "  -> IP: " << listen_ip << ", Port: " << listen_port << std::endl;
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_fd, 10) < 0) {
         perror("Dinleme (listen) hatası"); close(server_fd); exit(EXIT_FAILURE);
     }
 
-    std::cout << "Sunucu başlatıldı. Port " << PORT << " dinleniyor..." << std::endl;
-    print_server_clients_list();
+    std::cout << "Sunucu başlatıldı. Dinlenen IP: " << listen_ip << ", Port: " << listen_port << std::endl;
+    print_server_clients_list(); // Başlangıç listesini yazdır
 
+    // --- Geri kalan accept döngüsü aynı ---
     while (true) {
         struct sockaddr_in client_address;
         socklen_t client_addrlen = sizeof(client_address);
@@ -304,7 +346,7 @@ int main() {
             continue;
         }
 
-        std::string client_ip = inet_ntoa(client_address.sin_addr);
+        std::string client_ip = inet_ntoa(client_address.sin_addr); // Bağlanan istemcinin IP'si
         std::string new_id;
 
         // Yeni istemci için bilgileri kaydet (Mutex içinde)
@@ -316,27 +358,23 @@ int main() {
             id_by_socket[new_socket] = new_id;
         }
 
-         std::cout << "\nYeni bağlantı kabul edildi. IP: " << client_ip << ", Atanan ID: " << new_id << std::endl;
-
+         std::cout << "\nYeni bağlantı kabul edildi. Gelen IP: " << client_ip << ", Atanan ID: " << new_id << std::endl;
 
         // İstemciye ID'sini gönder
         if (!send_message(new_socket, "ID " + new_id)) {
              std::cerr << "Hata: İstemciye ID gönderilemedi (ID: " << new_id << ")" << std::endl;
-             // Hata durumunda temizlik yap
              {
                   std::lock_guard<std::mutex> lock(clients_mutex);
                   clients_by_id.erase(new_id);
                   id_by_socket.erase(new_socket);
              }
              close(new_socket);
-             print_server_clients_list(); // Liste durumunu güncelle
-             continue; // Bir sonraki bağlantıyı bekle
+             print_server_clients_list();
+             continue;
         }
 
+        print_server_clients_list(); // Liste durumunu güncelle
 
-        print_server_clients_list(); // Bağlantı sonrası listeyi güncelle
-
-        // İstemciyi ayrı bir thread'de işle
         std::thread client_thread(handle_client, new_socket, new_id);
         client_thread.detach();
     }
