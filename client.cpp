@@ -20,7 +20,6 @@ bool send_server_message(const std::string& message) {
     std::string full_message = message + "\n";
     return send(sock, full_message.c_str(), full_message.length(), 0) >= 0;
 }
-
 // Sunucudan gelen mesajları dinleyen ve işleyen fonksiyon (thread üzerinde çalışacak)
 void receive_messages() {
     char buffer[2048];
@@ -31,14 +30,14 @@ void receive_messages() {
         ssize_t bytes_read = read(sock, buffer, sizeof(buffer) - 1);
 
         if (bytes_read <= 0) {
-            if (running) { // Eğer program hala çalışıyorsa bağlantı koptu demektir
+            if (running) {
                  std::lock_guard<std::mutex> lock(cout_mutex);
                  std::cerr << "\n[Hata] Sunucu bağlantısı koptu!" << std::endl;
                  std::cout << "Çıkmak için Enter'a basın..." << std::endl;
             }
-            running = false; // Ana döngünün bitmesini sağla
-            close(sock); // Soketi kapat
-            sock = -1;   // Geçersiz kıl
+            running = false;
+            // close(sock); // shutdown signal_handler'da çağrılıyor genelde
+            // sock = -1;
             break;
         }
 
@@ -49,23 +48,82 @@ void receive_messages() {
              std::string server_msg_line = partial_message.substr(0, newline_pos);
              partial_message.erase(0, newline_pos + 1);
 
-             std::lock_guard<std::mutex> lock(cout_mutex); // Konsola yazmadan önce kilitle
-             std::cout << "\n[Sunucu Mesajı] " << server_msg_line << std::endl;
-             std::cout << "> "; // Yeni komut istemi
-             std::cout.flush(); // Konsolu hemen güncelle
-
-             // Gelen mesaja göre işlem yapabiliriz (Örn: ID atama)
              std::stringstream ss(server_msg_line);
              std::string msg_type;
              ss >> msg_type;
-             if (msg_type == "ID") {
-                  ss >> my_id;
-                  std::cout << "[Bilgi] ID'niz: " << my_id << std::endl;
-                  std::cout << "> "; std::cout.flush();
-             }
-             // Diğer mesaj türlerini burada işleyebiliriz (LIST_BEGIN, INCOMING, ACCEPTED vb.)
-        }
-    }
+
+             // --- Gelen Mesajları İşleme ve Kullanıcıyı Bilgilendirme ---
+             { // Mutex kilidini bu blok boyunca aktif tutalım
+                std::lock_guard<std::mutex> lock(cout_mutex);
+                std::cout << "\n[Sunucu] " << server_msg_line << std::endl; // Ham mesajı yine de gösterelim (debug için)
+
+                if (msg_type == "ID") {
+                    ss >> my_id;
+                    std::cout << "[Bilgi] Size atanan ID: " << my_id << std::endl;
+                } else if (msg_type == "INCOMING") { // <<< DEĞİŞİKLİK BURADA BAŞLIYOR
+                    std::string source_id;
+                    ss >> source_id;
+                    std::cout << "----------------------------------------" << std::endl;
+                    std::cout << "[Bağlantı İsteği] ID '" << source_id << "' sizinle bağlanmak istiyor." << std::endl;
+                    std::cout << "Kabul etmek için: accept " << source_id << std::endl;
+                    std::cout << "Reddetmek için:   reject " << source_id << std::endl;
+                    std::cout << "----------------------------------------" << std::endl;
+                } else if (msg_type == "CONNECTING") {
+                     std::string target_id;
+                     ss >> target_id;
+                     std::cout << "[Bilgi] ID '" << target_id << "' hedefine bağlantı isteği gönderildi, yanıt bekleniyor..." << std::endl;
+                } else if (msg_type == "ACCEPTED") {
+                    std::string peer_id;
+                    ss >> peer_id;
+                    std::cout << "[Bilgi] Bağlantı isteğiniz ID '" << peer_id << "' tarafından KABUL EDİLDİ." << std::endl;
+                } else if (msg_type == "REJECTED") {
+                    std::string peer_id;
+                    ss >> peer_id;
+                    std::cout << "[Bilgi] Bağlantı isteğiniz ID '" << peer_id << "' tarafından REDDEDİLDİ." << std::endl;
+                } else if (msg_type == "CONNECTION_ESTABLISHED") {
+                    std::string peer_id;
+                    ss >> peer_id;
+                    std::cout << "[Bilgi] ID '" << peer_id << "' ile BAĞLANTI KURULDU." << std::endl;
+                    std::cout << "Artık 'msg <mesaj>' ile mesaj gönderebilirsiniz." << std::endl;
+                    std::cout << "Bağlantıyı bitirmek için 'disconnect' komutunu kullanın." << std::endl;
+                } else if (msg_type == "PEER_DISCONNECTED") {
+                    std::string peer_id;
+                    ss >> peer_id;
+                    std::cout << "[Bilgi] ID '" << peer_id << "' bağlantısı KESİLDİ." << std::endl;
+                } else if (msg_type == "DISCONNECTED_OK") {
+                     std::cout << "[Bilgi] Mevcut bağlantınız başarıyla sonlandırıldı." << std::endl;
+                } else if (msg_type == "MSG_FROM") {
+                    std::string source_id;
+                    ss >> source_id;
+                    // Mesajın geri kalanını al
+                    std::string message_content;
+                    size_t first_space = server_msg_line.find(' ');
+                    size_t second_space = (first_space != std::string::npos) ? server_msg_line.find(' ', first_space + 1) : std::string::npos;
+                    if (second_space != std::string::npos) {
+                        message_content = server_msg_line.substr(second_space + 1);
+                    }
+                    std::cout << "[Mesaj (" << source_id << ")] " << message_content << std::endl;
+                } else if (msg_type == "ERROR") {
+                     std::string error_message;
+                     size_t first_space = server_msg_line.find(' ');
+                     if (first_space != std::string::npos) {
+                          error_message = server_msg_line.substr(first_space + 1);
+                     }
+                     std::cerr << "[Sunucu Hatası] " << error_message << std::endl;
+                } else if (msg_type == "LIST_BEGIN") {
+                     std::cout << "--- Bağlı İstemciler Listesi ---" << std::endl;
+                } else if (msg_type == "LIST_END") {
+                     std::cout << "--------------------------------" << std::endl;
+                } else if (server_msg_line.rfind("ID: ", 0) == 0) { // LIST komutunun içeriği için basit kontrol
+                     std::cout << "  " << server_msg_line << std::endl; // Liste elemanını yazdır
+                }
+                // Diğer sunucu mesajlarını burada işleyebilirsiniz...
+
+                std::cout << "> "; // Yeni komut istemi
+                std::cout.flush(); // Konsolu hemen güncelle
+            } // Mutex kilidi bloğu sonu
+        } // while (newline_pos)
+    } // while (running)
      // Thread bittiğinde belirtelim (isteğe bağlı)
      {
         std::lock_guard<std::mutex> lock(cout_mutex);
@@ -73,7 +131,7 @@ void receive_messages() {
      }
 }
 
-// Sinyal işleyici
+// ... (main fonksiyonu ve signal_handler aynı kalabilir) ...// Sinyal işleyici
 void signal_handler(int signum) {
    {
       std::lock_guard<std::mutex> lock(cout_mutex);
