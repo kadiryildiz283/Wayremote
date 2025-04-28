@@ -7,12 +7,10 @@
 #include <sstream>      // Sayıyı string'e çevirmek için
 #include <iomanip>      // String formatlama için (örn. başa sıfır ekleme)
 
-// İstemci bağlantısını temsil eden basit bir yapı
 // Gerçek uygulamada socket descriptor, IP adresi vb. bilgiler içerebilir
 struct ConnectionInfo {
     int socket_fd; // Örnek olarak socket dosya tanımlayıcısını tutalım
     std::string ip_address;
-    // ... diğer gerekli bilgiler
 };
 
 // Kimlik (ID) yönetimini yapan sınıf
@@ -22,7 +20,7 @@ public:
         // Rastgele sayı üreteci için başlangıç ayarı
         std::random_device rd;
         gen_ = std::mt19937(rd());
-        dist_ = std::uniform_int_distribution<>(100000, 999999); // 6 haneli ID için
+        dist_ = std::uniform_int_distribution<>(1000000, 9999999); // 7 haneli ID için
     }
 
     // Yeni bir istemci kaydeder ve ona benzersiz bir ID atar
