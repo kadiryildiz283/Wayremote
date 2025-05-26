@@ -1,0 +1,483 @@
+#include <iostream>
+#include <string>
+#include <unordered_map>
+#include <thread>
+#include <mutex>
+#include <random>
+#include <sstream>
+#include <iomanip>
+#include <cstring>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+
+
+
+struct ClientInfo {
+    int socket_fd;
+    std::string ip_address;
+    std::string status = "Idle"; // Idle, Connecting, Connected, VncReady, VncTunnelling
+    std::string pending_peer_id = "";
+    // VNC tünelleme başladığında, satır satır okumak yerine ham veri okuyacağız.
+    // Bu yüzden istemciden gelen tamamlanmamış veriyi biriktirmek için bir tampon.
+    std::vector<char> incoming_buffer; // Her istemci için ayrı
+};
+std::unordered_map<std::string, ClientInfo> clients_by_id; // ID -> ClientInfo
+std::unordered_map<int, std::string> id_by_socket;     // socket_fd -> ID
+std::mutex clients_mutex;                              // Veri yapılarını korumak için mutex
+
+// --- Yardımcı Fonksiyonlar ---
+
+// Rastgele benzersiz ID üretir
+std::string generate_unique_id() {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> dist(100000, 999999);
+    std::string new_id;
+    do {
+        std::stringstream ss;
+        ss << std::setw(6) << std::setfill('0') << dist(gen);
+        new_id = ss.str();
+    } while (clients_by_id.count(new_id)); // Haritada zaten varsa tekrar üret
+    return new_id;
+}
+
+// Sokete güvenli mesaj gönderir (sonuna '\n' ekler)
+bool send_message(int socket_fd, const std::string& message) {
+    std::string full_message = message + "\n";
+    return send(socket_fd, full_message.c_str(), full_message.length(), 0) >= 0;
+}
+
+// Bağlı istemcilerin listesini sunucu konsoluna yazdırır
+// Bağlı istemcilerin listesini sunucu konsoluna yazdırmak için fonksiyon
+void print_server_clients_list() {
+    // std::lock_guard<std::mutex> lock(clients_mutex); // << BU SATIRI SİLİN VEYA YORUM SATIRI YAPIN!
+    // Mutex zaten bu fonksiyonu çağıran yerde (handle_client içinde) kilitli.
+
+    // system("clear"); // İsteğe bağlı, sürekli temizlemek yerine alta ekleyebilir
+    std::cout << "\n--- Sunucu: Bağlı İstemciler ---" << std::endl; // Başına \n ekleyerek alta yazmasını sağlayalım
+    if (clients_by_id.empty()) {
+        std::cout << "(Şu an bağlı istemci yok)" << std::endl;
+    } else {
+        // Mutex kilidi dışarıda alındığı için burada güvenle erişebiliriz
+        for (const auto& pair : clients_by_id) {
+            std::cout << "  - ID: " << pair.first
+                      << ", IP: " << pair.second.ip_address
+                      << ", Soket: " << pair.second.socket_fd
+                      << ", Durum: " << pair.second.status;
+            if (!pair.second.pending_peer_id.empty()) {
+                 std::cout << " (Peer: " << pair.second.pending_peer_id << ")";
+            }
+            std::cout << std::endl;
+        }
+    }
+    std::cout << "---------------------------------" << std::endl;
+    std::cout << "Yeni bağlantılar bekleniyor..." << std::endl;
+}
+// --- İstemci İşleme Mantığı ---
+void handle_client(int client_socket, std::string client_id_param) { // client_id_param aldık
+    // Bu thread'in yönettiği istemcinin ID'si, bağlantı koptuğunda kullanmak için.
+    // Parametre olarak gelen client_id_param, bu thread'in en başında atanan ID.
+    // Haritadan silinirse bile bu kopyası kalır.
+    std::string current_client_id = client_id_param;
+
+    // char buffer[2048]; // Ham veri okumak için std::vector kullanacağız
+    std::vector<char> buffer(4096 * 2); // 8KB tampon
+    // std::string partial_message; // Artık ClientInfo içinde
+
+    // ClientInfo'dan buffer'a referans alalım (sunucu her zaman çalışacağı için referans güvenli)
+    // std::vector<char>& client_specific_buffer = clients_by_id.at(current_client_id).incoming_buffer;
+    // Yukarıdaki satır riskli, çünkü clients_by_id'den silinirse referans geçersiz olur.
+    // Her döngüde kontrol etmek daha iyi.
+
+    std::cout << "Sunucu: İstemci thread'i başlatıldı ID: " << current_client_id << ", Soket: " << client_socket << std::endl;
+
+    while (true) {
+        // --- İstemci Durumunu ve Peer Bilgilerini Al ---
+        std::string client_status;
+        std::string peer_id_for_relay;
+        int peer_socket_for_relay = -1;
+        bool is_valid_client = false;
+
+        { // Mutex'i sadece haritaya erişirken kilitleyelim
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            if (clients_by_id.count(current_client_id)) {
+                is_valid_client = true;
+                const auto& client_info_ref = clients_by_id.at(current_client_id);
+                client_status = client_info_ref.status; // Mevcut durumu al
+                if (client_status == "VncTunnelling" || client_status == "Connected" || client_status == "VncReady") { // Genişletilmiş kontrol
+                    if (!client_info_ref.pending_peer_id.empty() && clients_by_id.count(client_info_ref.pending_peer_id)) {
+                        peer_id_for_relay = client_info_ref.pending_peer_id;
+                        peer_socket_for_relay = clients_by_id.at(peer_id_for_relay).socket_fd;
+                    }
+                }
+            }
+        }
+
+        if (!is_valid_client) { // Eğer istemci artık haritada yoksa (bağlantı kopmuş olabilir)
+            std::cout << "Sunucu: İstemci " << current_client_id << " artık haritada değil, thread sonlandırılıyor." << std::endl;
+            break;
+        }
+
+        // --- Veri Oku ---
+        ssize_t bytes_read = read(client_socket, buffer.data(), buffer.size());
+
+        if (bytes_read <= 0) {
+            // Hata veya bağlantı kapandı, temizlik ve çıkış aşağıda yapılacak
+            break;
+        }
+
+        // --- Veriyi İşle ---
+        if (client_status == "VncTunnelling" && peer_socket_for_relay != -1) {
+            // --- VNC Tünelleme Modu ---
+            std::cout << "[Relay] Sunucu: ID " << current_client_id << " -> ID " << peer_id_for_relay
+                      << " : " << bytes_read << " byte HAM VERİ aktarılıyor." << std::endl;
+            if (send(peer_socket_for_relay, buffer.data(), bytes_read, 0) < 0) {
+                perror(("[Relay HATA] ID " + peer_id_for_relay + " hedefine veri gönderilemedi").c_str());
+                // Belki burada bağlantıyı kesmek veya durumu değiştirmek gerekebilir
+            }
+            // Bu modda başka komut işleme yok (şimdilik DISCONNECT hariç tutulabilir)
+            // Ama DISCONNECT mesajı da ham veri gibi gelebilir. Bunu daha sonra iyileştireceğiz.
+        } else {
+            // --- Komut Modu ---
+            // Gelen veriyi std::vector<char>& client_specific_buffer'a ekle
+            std::vector<char>* client_specific_buffer_ptr = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(clients_mutex);
+                if (clients_by_id.count(current_client_id)) { // Hala var mı kontrol et
+                    client_specific_buffer_ptr = &clients_by_id.at(current_client_id).incoming_buffer;
+                }
+            }
+
+            if (!client_specific_buffer_ptr) break; // İstemci silinmişse çık
+
+            client_specific_buffer_ptr->insert(client_specific_buffer_ptr->end(), buffer.data(), buffer.data() + bytes_read);
+
+            size_t newline_pos;
+            // std::string olarak işlemek için buffer'ı string'e çevir (geçici)
+            // Daha verimli bir yol, client_specific_buffer'dan doğrudan \n aramak olabilir.
+            std::string current_data_str(client_specific_buffer_ptr->begin(), client_specific_buffer_ptr->end());
+
+            while ((newline_pos = current_data_str.find('\n')) != std::string::npos) {
+                std::string command_line = current_data_str.substr(0, newline_pos);
+                // İşlenen kısmı buffer'dan sil
+                client_specific_buffer_ptr->erase(client_specific_buffer_ptr->begin(), client_specific_buffer_ptr->begin() + newline_pos + 1);
+                current_data_str.assign(client_specific_buffer_ptr->begin(), client_specific_buffer_ptr->end()); // Kalanı güncelle
+
+
+                std::cout << "Sunucu: ID " << current_client_id << "'den komut alındı: " << command_line << std::endl;
+                std::stringstream ss(command_line);
+                std::string command;
+                ss >> command;
+
+                std::lock_guard<std::mutex> lock(clients_mutex); // Harita işlemleri için kilitle
+
+                // START_VNC_TUNNEL Komutu
+                if (command == "START_VNC_TUNNEL") {
+                    if (clients_by_id.count(current_client_id)) {
+                        auto& initiator_info = clients_by_id.at(current_client_id);
+                        if (initiator_info.status == "Connected" && !initiator_info.pending_peer_id.empty() &&
+                            clients_by_id.count(initiator_info.pending_peer_id)) {
+                            
+                            initiator_info.status = "VncReady";
+                            std::cout << "Sunucu: ID " << current_client_id << " durumu VncReady olarak ayarlandı." << std::endl;
+
+                            auto& peer_info = clients_by_id.at(initiator_info.pending_peer_id);
+                            if (peer_info.status == "VncReady") {
+                                std::cout << "Sunucu: Her iki taraf da VncReady! ID " << current_client_id 
+                                          << " ve ID " << initiator_info.pending_peer_id << " için VncTunnelling başlatılıyor." << std::endl;
+                                initiator_info.status = "VncTunnelling";
+                                peer_info.status = "VncTunnelling";
+                                // İstemcilere tünelin başladığını bildirebiliriz (opsiyonel)
+                                // send_message(initiator_info.socket_fd, "TUNNEL_STARTED");
+                                // send_message(peer_info.socket_fd, "TUNNEL_STARTED");
+                            } else {
+                                std::cout << "Sunucu: ID " << current_client_id << " VncReady, peer ("
+                                          << initiator_info.pending_peer_id << ") bekleniyor (Durumu: " << peer_info.status << ")" << std::endl;
+                            }
+                        } else {
+                            send_message(client_socket, "ERROR START_VNC_TUNNEL için uygun durumda değilsiniz.");
+                        }
+                    }
+                }           // --- LIST Komutu ---
+            if (command == "LIST") {
+                std::string list_response = "LIST_BEGIN";
+                for (const auto& pair : clients_by_id) {
+                     // Kendisini listeye ekleme
+                    if (pair.first == client_id) continue;
+                    list_response += "\nID: " + pair.first + " Durum: " + pair.second.status;
+                }
+                list_response += "\nLIST_END";
+                send_message(client_socket, list_response);
+            }
+            // --- CONNECT Komutu ---
+            else if (command == "CONNECT") {
+                std::string target_id;
+                ss >> target_id;
+
+                if (clients_by_id.count(client_id) && clients_by_id.count(target_id) && client_id != target_id) {
+                    auto& source_info = clients_by_id[client_id];
+                    auto& target_info = clients_by_id[target_id];
+
+                    if (source_info.status == "Idle" && target_info.status == "Idle") {
+                        source_info.status = "Connecting";
+                        source_info.pending_peer_id = target_id;
+                        target_info.status = "Connecting";
+                        target_info.pending_peer_id = client_id;
+
+                        send_message(target_info.socket_fd, "INCOMING " + client_id);
+                        send_message(source_info.socket_fd, "CONNECTING " + target_id);
+                        std::cout << "Sunucu: " << client_id << " -> " << target_id << " bağlantı isteği gönderildi." << std::endl;
+                    } else {
+                        send_message(client_socket, "ERROR Hedef veya siz uygun durumda değilsiniz.");
+                    }
+                } else {
+                     send_message(client_socket, "ERROR Geçersiz veya bulunamayan ID.");
+                }
+                 print_server_clients_list(); // Liste durumunu güncelle
+            }
+            // --- ACCEPT Komutu ---
+             else if (command == "ACCEPT") {
+                std::string requester_id;
+                ss >> requester_id;
+
+                 if (clients_by_id.count(client_id) && clients_by_id.count(requester_id)) {
+                    auto& accepter_info = clients_by_id[client_id];
+                    auto& requester_info = clients_by_id[requester_id];
+
+                    // Doğru durumda olup olmadıklarını kontrol et
+                    if (accepter_info.status == "Connecting" && accepter_info.pending_peer_id == requester_id &&
+                        requester_info.status == "Connecting" && requester_info.pending_peer_id == client_id)
+                    {
+                         accepter_info.status = "Connected";
+                         requester_info.status = "Connected";
+                         // pending_peer_id'yi temizlemeye gerek yok, kiminle bağlı olduğunu gösterir
+
+                         send_message(requester_info.socket_fd, "ACCEPTED " + client_id);
+                         send_message(accepter_info.socket_fd, "CONNECTION_ESTABLISHED " + requester_id);
+                         std::cout << "Sunucu: " << client_id << " <-> " << requester_id << " bağlantısı kuruldu." << std::endl;
+                    } else {
+                         send_message(client_socket, "ERROR Geçersiz kabul komutu veya durum.");
+                    }
+                 } else {
+                     send_message(client_socket, "ERROR Geçersiz ID.");
+                 }
+                 print_server_clients_list(); // Liste durumunu güncelle
+            }
+            // --- REJECT Komutu ---
+            else if (command == "REJECT") {
+                std::string requester_id;
+                ss >> requester_id;
+
+                if (clients_by_id.count(client_id) && clients_by_id.count(requester_id)) {
+                    auto& rejecter_info = clients_by_id[client_id];
+                    auto& requester_info = clients_by_id[requester_id];
+
+                    if (rejecter_info.status == "Connecting" && rejecter_info.pending_peer_id == requester_id &&
+                        requester_info.status == "Connecting" && requester_info.pending_peer_id == client_id)
+                    {
+                        rejecter_info.status = "Idle";
+                        requester_info.status = "Idle";
+                        rejecter_info.pending_peer_id = "";
+                        requester_info.pending_peer_id = "";
+
+                        send_message(requester_info.socket_fd, "REJECTED " + client_id);
+                        send_message(rejecter_info.socket_fd, "REJECTION_SENT " + requester_id);
+                         std::cout << "Sunucu: " << client_id << " -> " << requester_id << " bağlantı isteğini reddetti." << std::endl;
+                    } else {
+                        send_message(client_socket, "ERROR Geçersiz reddetme komutu veya durum.");
+                    }
+                } else {
+                    send_message(client_socket, "ERROR Geçersiz ID.");
+                }
+                 print_server_clients_list(); // Liste durumunu güncelle
+            }
+             // --- MSG Komutu (Şimdilik basit metin aktarımı) ---
+             else if (command == "MSG") {
+                 if (clients_by_id.count(client_id)) {
+                     auto& sender_info = clients_by_id[client_id];
+                     if (sender_info.status == "Connected" && !sender_info.pending_peer_id.empty()) {
+                         std::string peer_id = sender_info.pending_peer_id;
+                         if(clients_by_id.count(peer_id)) {
+                             auto& receiver_info = clients_by_id[peer_id];
+                             // Komut satırının geri kalanını mesaj olarak al
+                             size_t first_space = command_line.find(' ');
+                             std::string message_content = (first_space != std::string::npos) ? command_line.substr(first_space + 1) : "";
+                             send_message(receiver_info.socket_fd, "MSG_FROM " + client_id + " " + message_content);
+                             //std::cout << "Sunucu: " << client_id << " -> " << peer_id << " mesaj iletildi." << std::endl; // Çok kalabalık yapabilir
+                         }
+                     } else {
+                          send_message(client_socket, "ERROR Mesaj göndermek için bağlı olmalısınız.");
+                     }
+                 }
+             }
+             // --- DISCONNECT Komutu (Bağlantıyı sonlandırmak için) ---
+              else if (command == "DISCONNECT") {
+                   if (clients_by_id.count(client_id)) {
+                       auto& self_info = clients_by_id[client_id];
+                       if (self_info.status == "Connected" && !self_info.pending_peer_id.empty()) {
+                           std::string peer_id = self_info.pending_peer_id;
+                            if(clients_by_id.count(peer_id)) {
+                                auto& peer_info = clients_by_id[peer_id];
+                                send_message(peer_info.socket_fd, "PEER_DISCONNECTED " + client_id);
+                                peer_info.status = "Idle";
+                                peer_info.pending_peer_id = "";
+                                std::cout << "Sunucu: " << peer_id << " bağlantısı " << client_id << " tarafından kesildi." << std::endl;
+                            }
+                           self_info.status = "Idle";
+                           self_info.pending_peer_id = "";
+                           send_message(client_socket, "DISCONNECTED_OK");
+                           std::cout << "Sunucu: " << client_id << " mevcut bağlantısını kesti." << std::endl;
+                       } else {
+                           send_message(client_socket, "ERROR Kesilecek aktif bağlantı yok.");
+                       }
+                   }
+                    print_server_clients_list(); // Liste durumunu güncelle
+              }
+            // Bilinmeyen komutları yoksayabilir veya hata gönderebiliriz
+            // else { send_message(client_socket, "ERROR Bilinmeyen komut."); }
+
+        } // while (newline_pos)
+    } // while (true) - read loop
+
+    // --- Bağlantı Koptuğunda Temizlik ---
+    std::cout << "\nSunucu: İstemci bağlantısı koptu veya hata (ID: " << client_id << ", Soket: " << client_socket << ")" << std::endl;
+    {
+        std::lock_guard<std::mutex> lock(clients_mutex);
+        if (clients_by_id.count(client_id)) {
+             auto& client_info = clients_by_id[client_id];
+             // Eğer başka bir istemciyle bağlıysa, diğer istemciye haber ver
+             if (client_info.status == "Connected" && !client_info.pending_peer_id.empty()) {
+                  std::string peer_id = client_info.pending_peer_id;
+                  if(clients_by_id.count(peer_id)) {
+                       auto& peer_info = clients_by_id[peer_id];
+                       send_message(peer_info.socket_fd, "PEER_DISCONNECTED " + client_id);
+                       peer_info.status = "Idle";
+                       peer_info.pending_peer_id = "";
+                       std::cout << "Sunucu: Bağlantıdaki diğer istemci (" << peer_id << ") bilgilendirildi." << std::endl;
+                  }
+             }
+            clients_by_id.erase(client_id); // Ana haritadan sil
+        }
+        id_by_socket.erase(client_socket); // Ters lookup haritasından sil
+    }
+    print_server_clients_list(); // Liste durumunu güncelle
+    close(client_socket);        // Soketi kapat
+}
+
+
+// --- Ana Sunucu Döngüsü ---
+int main(int argc, char *argv[]) { // argc ve argv eklendi
+    // Varsayılan değerler
+    const char* DEFAULT_IP = "0.0.0.0"; // Tüm arayüzlerden dinle (localhost dahil)
+    int DEFAULT_PORT = 12345;
+
+    const char* listen_ip = DEFAULT_IP;
+    int listen_port = DEFAULT_PORT;
+
+    // Komut satırı argümanlarını kontrol et
+    if (argc == 3) {
+        listen_ip = argv[1];
+        try {
+            listen_port = std::stoi(argv[2]); // String'i integer'a çevir
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "Hata: Geçersiz port numarası: " << argv[2] << std::endl;
+            return 1;
+        } catch (const std::out_of_range& e) {
+             std::cerr << "Hata: Port numarası çok büyük: " << argv[2] << std::endl;
+            return 1;
+        }
+    } else if (argc != 1) { // Ya argüman yok ya da 2 tane olmalı
+        std::cerr << "Kullanım: " << argv[0] << " [dinlenecek_ip] [dinlenecek_port]" << std::endl;
+        std::cerr << "Örnek: " << argv[0] << " 0.0.0.0 12345" << std::endl;
+        std::cerr << "Argüman verilmezse varsayılan olarak " << DEFAULT_IP << ":" << DEFAULT_PORT << " kullanılır." << std::endl;
+        return 1;
+    }
+
+    int server_fd;
+    struct sockaddr_in address;
+    int opt = 1;
+
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("Soket oluşturulamadı"); exit(EXIT_FAILURE);
+    }
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt))) {
+        perror("setsockopt hatası"); close(server_fd); exit(EXIT_FAILURE);
+    }
+    address.sin_family = AF_INET;
+
+    // IP adresini ayarla (komut satırından veya varsayılan)
+    // inet_pton kullanmak inet_addr'dan daha modern ve IPv6 uyumludur.
+    if (inet_pton(AF_INET, listen_ip, &address.sin_addr) <= 0) {
+        std::cerr << "Hata: Geçersiz veya desteklenmeyen IP adresi: " << listen_ip << std::endl;
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    // Portu ayarla (komut satırından veya varsayılan)
+    address.sin_port = htons(listen_port);
+
+    // Soketi IP ve Porta bağla
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("Bağlama (bind) hatası");
+        std::cerr << "  -> IP: " << listen_ip << ", Port: " << listen_port << std::endl;
+        close(server_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        perror("Dinleme (listen) hatası"); close(server_fd); exit(EXIT_FAILURE);
+    }
+
+    std::cout << "Sunucu başlatıldı. Dinlenen IP: " << listen_ip << ", Port: " << listen_port << std::endl;
+    print_server_clients_list(); // Başlangıç listesini yazdır
+
+    // --- Geri kalan accept döngüsü aynı ---
+    while (true) {
+        struct sockaddr_in client_address;
+        socklen_t client_addrlen = sizeof(client_address);
+        int new_socket = accept(server_fd, (struct sockaddr *)&client_address, &client_addrlen);
+
+        if (new_socket < 0) {
+            perror("Bağlantı kabul (accept) hatası");
+            continue;
+        }
+
+        std::string client_ip = inet_ntoa(client_address.sin_addr); // Bağlanan istemcinin IP'si
+        std::string new_id;
+
+        // Yeni istemci için bilgileri kaydet (Mutex içinde)
+        {
+            std::lock_guard<std::mutex> lock(clients_mutex);
+            new_id = generate_unique_id();
+            ClientInfo client_info = {new_socket, client_ip, "Idle", ""};
+            clients_by_id[new_id] = client_info;
+            id_by_socket[new_socket] = new_id;
+        }
+
+         std::cout << "\nYeni bağlantı kabul edildi. Gelen IP: " << client_ip << ", Atanan ID: " << new_id << std::endl;
+
+        // İstemciye ID'sini gönder
+        if (!send_message(new_socket, "ID " + new_id)) {
+             std::cerr << "Hata: İstemciye ID gönderilemedi (ID: " << new_id << ")" << std::endl;
+             {
+                  std::lock_guard<std::mutex> lock(clients_mutex);
+                  clients_by_id.erase(new_id);
+                  id_by_socket.erase(new_socket);
+             }
+             close(new_socket);
+             print_server_clients_list();
+             continue;
+        }
+
+        print_server_clients_list(); // Liste durumunu güncelle
+
+        std::thread client_thread(handle_client, new_socket, new_id);
+        client_thread.detach();
+    }
+
+    close(server_fd);
+    return 0;
+}

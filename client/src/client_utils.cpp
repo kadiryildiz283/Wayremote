@@ -1,28 +1,97 @@
-#include "../includes/client_utils.h" // İlgili başlık dosyası
-#include <iostream>     // std::cout, std::cerr, std::endl
-#include <string>       // std::string
-#include <sstream>      // std::stringstream
-#include <cstdlib>      // system(), getenv(), free(), _exit()
-#include <cstdio>       // perror()
-#include <cstring>      // strdup(), memset() (gerçi memset main'deydi)
-#include <mutex>        // std::mutex, std::lock_guard (process_server_message'dan parametre olarak gelir)
+#include "../includes/client_utils.h" // Kendi başlık dosyamız
 
-// Platforma Özel Kütüphaneler (Linux/macOS için)
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <atomic>
+#include <algorithm> // std::transform
+#include <cstdlib>   // system(), getenv(), free(), _exit(), strdup()
+#include <cstdio>    // perror()
+#include <cstring>   // memset(), strdup()
+#include <cstdint>   // uint8_t için
+
+// Ağ işlemleri için
+#include <sys/socket.h>
+#include <netinet/in.h> // sockaddr_in, htons
+#include <arpa/inet.h>  // inet_pton, inet_ntoa
+#include <unistd.h>     // ::read, ::send, ::close, fork, execvp, _exit (POSIX)
+
 #ifndef _WIN32
-#include <unistd.h>     // fork, execvp, _exit, read, close (gerçi read/close main'deydi)
 #include <sys/types.h>  // pid_t
-#include <sys/wait.h>   // waitpid (kullanılmasa da genellikle ilgili)
-#include <sys/socket.h> // send()
-#else
-// Windows'a özel bir include gerekirse buraya eklenebilir (örn. Windows.h)
-// Ancak şu anki kod sadece system("sc start...") kullandığı için <cstdlib> yeterli.
+#include <sys/wait.h>   // waitpid
 #endif
 
+// libVNCclient başlık dosyası
+#include <rfb/rfbclient.h>
 
-// --- Yardımcı Fonksiyonlar ---
+// --- Global Değişkenlere Erişim (client_main.cpp'de tanımlı olanlar) ---
+extern std::atomic<bool> running;
+extern std::mutex cout_mutex;
+// İstemci A'nın TUNNEL_ACTIVE bekleme durumu için (client_main.cpp'de tanımlı)
+extern std::atomic<bool> client_a_waiting_for_tunnel_activation;
+std::atomic<bool> client_a_waiting_for_tunnel_activation(false); // <<-- BU SATIRI EKLEYİN VEYA KONTROL EDİN
 
+// --- libVNCclient için Global Framebuffer ve Yardımcılar ---
+static std::vector<uint8_t> g_vnc_framebuffer_storage;
+static int g_vnc_fb_width = 0;
+static int g_vnc_fb_height = 0;
+static unsigned int g_vnc_client_bpp = 0;
+static unsigned int g_vnc_client_depth = 0;
+
+// --- libVNCclient Callback Fonksiyonları ---
+static rfbBool AllocFrameBuffer(rfbClient* client) {
+    client->format.bitsPerPixel = 32;
+    client->format.depth = 24;
+    client->format.bigEndian = FALSE;
+    client->format.trueColour = TRUE;
+    client->format.redMax = 255; client->format.greenMax = 255; client->format.blueMax = 255;
+    client->format.redShift = 16; client->format.greenShift = 8; client->format.blueShift = 0; // RGBA varsayımı
+
+    size_t new_size = (size_t)client->width * client->height * (client->format.bitsPerPixel / 8);
+    if (g_vnc_framebuffer_storage.size() < new_size) {
+        try {
+            g_vnc_framebuffer_storage.resize(new_size);
+        } catch (const std::bad_alloc& e) {
+            std::lock_guard<std::mutex> lock(cout_mutex);
+            std::cerr << "[VNC Lib HATA] AllocFrameBuffer: Bellek ayrılamadı - " << e.what() << std::endl;
+            return FALSE;
+        }
+    }
+    client->frameBuffer = g_vnc_framebuffer_storage.data();
+    if (client->frameBuffer) {
+        g_vnc_fb_width = client->width;
+        g_vnc_fb_height = client->height;
+        g_vnc_client_bpp = client->format.bitsPerPixel;
+        g_vnc_client_depth = client->format.depth;
+        {
+            std::lock_guard<std::mutex> lock(cout_mutex);
+            std::cout << "[VNC Lib] AllocFrameBuffer: İstemci Formatı " << g_vnc_fb_width << "x" << g_vnc_fb_height
+                      << " bpp:" << g_vnc_client_bpp << " depth:" << g_vnc_client_depth
+                      << " | Buffer boyutu: " << g_vnc_framebuffer_storage.size() << " byte" << std::endl;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void GotFrameBufferUpdate(rfbClient* client, int x, int y, int w, int h) {
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    std::cout << "[VNC Lib] GotFrameBufferUpdate: x=" << x << ", y=" << y << ", w=" << w << ", h=" << h << std::endl;
+    // TODO (SDL): Burada client->frameBuffer içindeki güncellenmiş piksel verisini SDL ile ekrana çiz.
+}
+
+static char* GetPassword(rfbClient* client) {
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    std::cout << "[VNC Lib] GetPassword çağrıldı. Şifresiz devam ediliyor." << std::endl;
+    return strdup(""); // libvncclient bu belleği serbest bırakır
+}
+
+// --- Diğer Yardımcı Fonksiyonlar ---
 #ifndef _WIN32
-// Linux/macOS için komutun PATH içinde olup olmadığını kontrol eder
 bool command_exists(const std::string& command_name) {
     std::string check_cmd = "which " + command_name + " > /dev/null 2>&1";
     int ret = system(check_cmd.c_str());
@@ -30,69 +99,48 @@ bool command_exists(const std::string& command_name) {
 }
 #endif
 
-// Sunucuya mesaj gönderir (sonuna '\n' ekler)
-bool send_server_message(int sock, const std::string& message) {
-    if (sock <= 0) return false;
+bool send_server_message(int sock_fd, const std::string& message) {
+    if (sock_fd <= 0) return false;
     std::string full_message = message + "\n";
-    // MSG_NOSIGNAL flag'i, kırık pipe durumunda SIGPIPE sinyali göndermesini engeller (Linux/BSD)
-    // Windows'ta bu flag yoktur, ancak send genellikle hata kodu döndürür.
     #ifdef __linux__
         int flags = MSG_NOSIGNAL;
     #else
         int flags = 0;
     #endif
-    ssize_t bytes_sent = send(sock, full_message.c_str(), full_message.length(), flags);
+    ssize_t bytes_sent = ::send(sock_fd, full_message.c_str(), full_message.length(), flags);
     if (bytes_sent < 0) {
-        // perror("send_server_message HATA"); // Çok fazla log üretebilir
+        // perror("send_server_message HATA"); // Detaylı hata için açılabilir
         return false;
     }
     return (size_t)bytes_sent == full_message.length();
 }
 
-
-// VNC Sunucusunu Platforma Göre Başlatan Fonksiyon
-// ÖNEMLİ: Bu fonksiyon çağrıldığında 'cout_mtx' kilidinin
-// çağıran fonksiyon (process_server_message) tarafından alınmış olduğu varsayılır.
 void start_vnc_server() {
-    // NO MUTEX LOCK HERE
-
+    // Bu fonksiyon çağrıldığında cout_mutex'in dışarıda kilitli olduğu varsayılır.
     std::cout << "[DEBUG] Entering start_vnc_server function." << std::endl;
-
-    int result = -1; // Başarı durumu için (-1: denemedi/hata, 0: başarılı deneme)
-    std::string command_to_run_str; // Sadece loglama için komut adı
-    char** argv_list = nullptr; // execvp için argüman listesi
-    bool command_attempted = false; // Bir komut denendi mi?
-    bool proceed_to_execute = false; // Kontrol sonrası çalıştırmaya uygun mu?
-    std::string session_type_str = "unknown"; // Linux için
+    int result = -1;
+    std::string command_to_run_str;
+    char** argv_list = nullptr;
+    bool command_attempted = false;
+    bool proceed_to_execute = false;
+    std::string session_type_str = "unknown";
 
     #ifdef _WIN32
-        // --- Windows ---
         std::cout << "[Platform] Windows algılandı." << std::endl;
         std::cout << "[Bilgi] Önceden yüklenmiş VNC servisi başlatılıyor..." << std::endl;
-
-        // !!! DEĞİŞTİRİLMELİ !!! Gerçek Windows Servis Adı buraya yazılacak.
-        const char* vnc_service_name = "YourVNCServiceName"; // Örn: "tvnserver", "uvnc_service"
-
-        std::string command_to_run = "sc start ";
-        command_to_run += vnc_service_name;
-        std::cout << "[DEBUG] Windows komutu deneniyor: " << command_to_run << std::endl;
-
-        result = system(command_to_run.c_str());
+        const char* vnc_service_name = "YourVNCServiceName"; // !!! DEĞİŞTİRİLMELİ !!!
+        std::string command_to_run_win = "sc start ";
+        command_to_run_win += vnc_service_name;
+        std::cout << "[DEBUG] Windows komutu deneniyor: " << command_to_run_win << std::endl;
+        result = system(command_to_run_win.c_str());
         command_attempted = true;
-
         if (result == 0) {
-             std::cout << "[Bilgi] 'sc start " << vnc_service_name << "' komutu başarıyla çalıştırıldı (Kod: 0)." << std::endl;
-             std::cout << "       (Servisin durumu kontrol edilmedi, başlatıldığı veya zaten çalıştığı varsayıldı)." << std::endl;
-             std::cout << "       VNC sunucusunun localhost:5900 (veya yapılandırılan port) üzerinde dinlediğini varsayıyoruz." << std::endl;
-             // result = 0; // Zaten 0
+            std::cout << "[Bilgi] 'sc start " << vnc_service_name << "' komutu başarıyla çalıştırıldı (Kod: 0)." << std::endl;
         } else {
-             std::cerr << "[Hata] VNC servisi ('" << vnc_service_name << "') başlatılamadı! (sc start dönüş kodu: " << result << ")" << std::endl;
-             std::cerr << "       Olası Nedenler: Servis bulunamadı, Yetki yok, Servis devre dışı vb." << std::endl;
-             result = -1; // Başarısızlık olarak işaretle
+            std::cerr << "[Hata] VNC servisi ('" << vnc_service_name << "') başlatılamadı! (sc dönüş kodu: " << result << ")" << std::endl;
+            result = -1;
         }
-
     #elif defined(__linux__)
-        // --- Linux ---
         std::cout << "[Platform] Linux algılandı." << std::endl;
         const char* session_type_env = getenv("XDG_SESSION_TYPE");
         session_type_str = session_type_env ? session_type_env : "unknown";
@@ -103,185 +151,288 @@ void start_vnc_server() {
             if (command_exists(command_to_run_str)) {
                 std::cout << "[Bilgi] 'wayvnc' bulundu. Argümanlar hazırlanıyor..." << std::endl;
                 argv_list = new char*[3];
-                argv_list[0] = strdup("wayvnc");
-                argv_list[1] = strdup("127.0.0.1");
-                argv_list[2] = NULL;
+                argv_list[0] = strdup("wayvnc"); argv_list[1] = strdup("127.0.0.1"); argv_list[2] = NULL;
                 proceed_to_execute = true;
-            } else {
-                std::cerr << "[HATA] 'wayvnc' komutu bulunamadı!" << std::endl;
-                std::cerr << "       Lütfen dağıtımınıza uygun komut ile kurun." << std::endl;
-            }
+            } else { std::cerr << "[HATA] 'wayvnc' komutu bulunamadı! Lütfen kurun." << std::endl; }
         } else if (session_type_str == "x11") {
             command_to_run_str = "x11vnc";
-             if (command_exists(command_to_run_str)) {
-                 std::cout << "[Bilgi] 'x11vnc' bulundu. Argümanlar hazırlanıyor..." << std::endl;
-                 argv_list = new char*[7];
-                 argv_list[0] = strdup("x11vnc");
-                 argv_list[1] = strdup("-localhost");
-                 argv_list[2] = strdup("-nopw");
-                 argv_list[3] = strdup("-once");
-                 argv_list[4] = strdup("-quiet");
-                 argv_list[5] = strdup("-bg");
-                 argv_list[6] = NULL;
-                 proceed_to_execute = true;
-             } else {
-                 std::cerr << "[HATA] 'x11vnc' komutu bulunamadı!" << std::endl;
-                 std::cerr << "       Lütfen dağıtımınıza uygun komut ile kurun." << std::endl;
-             }
-        } else {
-             std::cerr << "[Uyarı] Bilinmeyen veya desteklenmeyen Linux oturum türü: '" << session_type_str << "'" << std::endl;
-        }
+            if (command_exists(command_to_run_str)) {
+                std::cout << "[Bilgi] 'x11vnc' bulundu. Argümanlar hazırlanıyor..." << std::endl;
+                argv_list = new char*[7];
+                argv_list[0] = strdup("x11vnc"); argv_list[1] = strdup("-localhost");
+                argv_list[2] = strdup("-nopw"); argv_list[3] = strdup("-once");
+                argv_list[4] = strdup("-quiet"); argv_list[5] = strdup("-bg"); argv_list[6] = NULL;
+                proceed_to_execute = true;
+            } else { std::cerr << "[HATA] 'x11vnc' komutu bulunamadı! Lütfen kurun." << std::endl; }
+        } else { std::cerr << "[Uyarı] Bilinmeyen Linux oturum türü: '" << session_type_str << "'" << std::endl; }
 
-        // Eğer çalıştırmaya uygunsa fork/exec yap
         if (proceed_to_execute && argv_list != nullptr && argv_list[0] != nullptr) {
             std::cout << "[Bilgi] '" << command_to_run_str << "' fork/execvp ile deneniyor..." << std::endl;
             pid_t pid = fork();
-
-            if (pid == -1) {
-                perror("[HATA] fork başarısız");
-                result = -1;
-            } else if (pid == 0) {
-                // --- Çocuk İşlem ---
-                // std::cout << "[DEBUG] Çocuk işlem: execvp(" << argv_list[0] << ", ...) çağrılıyor..." << std::endl; // Çocukta cout riskli olabilir
+            if (pid == -1) { perror("[HATA] fork başarısız"); result = -1; }
+            else if (pid == 0) { // Çocuk işlem
                 execvp(argv_list[0], argv_list);
-                // Eğer execvp dönerse hata vardır
                 perror(("[HATA] execvp başarısız (" + std::string(argv_list[0]) + ")").c_str());
-                // Belleği temizle ve çık
-                for(int i = 0; argv_list[i] != NULL; ++i) { free(argv_list[i]); }
-                delete[] argv_list;
-                _exit(1); // Çocuğu _exit ile sonlandır
-            } else {
-                // --- Ebeveyn İşlem ---
+                for(int i = 0; argv_list[i] != NULL; ++i) { free(argv_list[i]); } delete[] argv_list;
+                _exit(1); // _exit!
+            } else { // Ebeveyn işlem
                 std::cout << "[Bilgi] '" << argv_list[0] << "' işlemi (PID: " << pid << ") başarıyla başlatıldı (ebeveyn)." << std::endl;
-                result = 0; // Başarılı başlatma (ebeveyn açısından)
+                result = 0;
             }
-            command_attempted = true; // Komut denendi
-
-             // Ebeveyn veya fork hatası durumunda ayrılan belleği temizle
-            if (pid != 0 && argv_list != nullptr) {
-                 for(int i = 0; argv_list[i] != NULL; ++i) { free(argv_list[i]); }
-                 delete[] argv_list;
-                 argv_list = nullptr; // Önemli: İşaretçiyi null yap
+            command_attempted = true;
+            if (pid != 0 && argv_list != nullptr) { // Ebeveyn veya fork hatasında temizle
+                for(int i = 0; argv_list[i] != NULL; ++i) { free(argv_list[i]); } delete[] argv_list; argv_list = nullptr;
             }
-
-        } else if (command_attempted) { // proceed_to_execute false ise veya argv_list hatalıysa
-             result = -1; // Başlatma denenemedi
-             // argv_list null kontrolü yukarıda var, tekrar temizlemeye gerek yok
-             if (argv_list != nullptr) { // Eğer sadece proceed_to_execute false idiyse ama liste ayrıldıysa
-                 for(int i = 0; argv_list[i] != NULL; ++i) { free(argv_list[i]); }
-                 delete[] argv_list;
-                 argv_list = nullptr;
-             }
-        } // Linux exec bitti
-
-
+        } else if (!command_to_run_str.empty() && !proceed_to_execute) { // Komut adı var ama bulunamadı/execute edilmedi
+            result = -1; command_attempted = true;
+        } else if (proceed_to_execute && (argv_list == nullptr || argv_list[0] == nullptr)) { // Hatalı argüman listesi
+             std::cerr << "[HATA] Komut için argüman listesi oluşturulamadı: " << command_to_run_str << std::endl;
+             result = -1; command_attempted = true; // Denendi ama başarısız
+        } else { result = -1; } // Diğer durumlar
     #elif defined(__APPLE__)
-        // --- macOS ---
-        std::cout << "[Platform] macOS algılandı." << std::endl;
+        std::cout << "[Platform] macOS algılandı." << std::endl; command_attempted = false;
         std::cout << "[Bilgi] Lütfen Sistem Ayarları > Paylaşma > Ekran Paylaşma'yı etkinleştirin." << std::endl;
-        command_attempted = false; // Bir komut denenmedi
-
     #else
-        // --- Bilinmeyen OS ---
-        std::cout << "[Uyarı] Bilinmeyen işletim sistemi." << std::endl;
-        command_attempted = false; // Bir komut denenmedi
+        std::cout << "[Uyarı] Bilinmeyen işletim sistemi." << std::endl; command_attempted = false;
     #endif
 
-    // Sonuç kontrolü (Sadece bir işlem başlatma denemesi yapıldıysa)
-    if (command_attempted) {
-        if (result == 0) {
-            // Başarı mesajı platforma özel blok içinde zaten yazıldı.
-        } else {
-             std::cerr << "[Hata] Genel işlem başlatma denemesi başarısız oldu (örn. fork hatası veya komut bulunamadı)." << std::endl;
-        }
+    if (command_attempted) { // Sadece bir komut denemesi yapıldıysa sonucu değerlendir
+        if (result != 0) { std::cerr << "[Hata] Genel VNC sunucu başlatma denemesi başarısız oldu." << std::endl; }
     }
-
-    std::cout << "       (Not: Henüz VNC trafiği tünellemesi aktif değil.)" << std::endl;
-    std::cout << "       Bağlantıyı bitirmek için 'disconnect' komutunu kullanın." << std::endl;
-
+    // Not: (Not: Henüz VNC trafiği...) mesajları process_server_message'a taşındı.
     std::cout << "[DEBUG] Exiting start_vnc_server function." << std::endl;
 }
 
+// VNC Uplink Thread (Agent B - Yerel VNC'den Sunucuya)
+void vnc_uplink_thread_func(int local_vnc_fd, int sock_to_relay, std::atomic<bool>& app_is_running_ref, std::mutex& c_mutex_ref) {
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[VNC Uplink] Thread başlatıldı. Yerel VNC (Soket: " << local_vnc_fd
+                  << ") dinleniyor. Relay sunucusu (Soket: " << sock_to_relay << ")" << std::endl;
+    }
+    // Sunucu komutları küçük harfe çevirdiği için küçük harf gönderiyoruz
+    if (!send_server_message(sock_to_relay, "start_vnc_tunnel")) {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cerr << "[VNC Uplink] HATA: Sunucuya 'start_vnc_tunnel' gönderilemedi." << std::endl;
+        if (local_vnc_fd > 0) ::close(local_vnc_fd);
+        std::cout << "[VNC Uplink] Thread sonlandırılıyor ('start_vnc_tunnel' hatası)." << std::endl;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[VNC Uplink] Sunucuya 'start_vnc_tunnel' komutu gönderildi." << std::endl;
+    }
 
-// Sunucudan Gelen Mesajları İşleyen Fonksiyon
-void process_server_message(const std::string& server_msg_line, std::string& my_id_ref, std::mutex& cout_mtx, int sock) {
-    // Kilidi fonksiyonun başında alıp sonunda bırakmak, içerideki tüm cout kullanımlarını korur
-    std::lock_guard<std::mutex> lock(cout_mtx);
+    std::vector<char> buffer(8192);
+    ssize_t bytes_read; ssize_t bytes_sent;
+    while (app_is_running_ref) {
+        bytes_read = ::read(local_vnc_fd, buffer.data(), buffer.size());
+        if (bytes_read > 0) {
+            { std::lock_guard<std::mutex> lock(c_mutex_ref);
+              std::cout << "[VNC Uplink] Yerel VNC'den " << bytes_read << " byte okundu. Relay sunucusuna gönderiliyor..." << std::endl; }
+            #ifdef __linux__
+                int flags = MSG_NOSIGNAL;
+            #else
+                int flags = 0;
+            #endif
+            bytes_sent = ::send(sock_to_relay, buffer.data(), bytes_read, flags);
+            if (bytes_sent < 0) { std::lock_guard<std::mutex> lock(c_mutex_ref); perror("[VNC Uplink] Relay'e veri gönderme hatası"); break; }
+            else if (bytes_sent < bytes_read) { std::lock_guard<std::mutex> lock(c_mutex_ref); std::cerr << "[VNC Uplink] UYARI: Relay'e eksik veri gönderildi." << std::endl;}
+        } else if (bytes_read == 0) { std::lock_guard<std::mutex> lock(c_mutex_ref); std::cout << "[VNC Uplink] Yerel VNC bağlantısı kapandı." << std::endl; break; }
+        else { // bytes_read < 0
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
+            std::lock_guard<std::mutex> lock(c_mutex_ref); perror("[VNC Uplink] Yerel VNC'den okuma hatası"); break;
+        }
+    }
+    if (local_vnc_fd > 0) { ::close(local_vnc_fd); }
+    { std::lock_guard<std::mutex> lock(c_mutex_ref); std::cout << "[VNC Uplink] Thread sonlandırıldı." << std::endl; }
+}
 
+// VNC Downlink Thread Fonksiyonu (İstemci A - Sunucudan Gelen VNC Verisini İşler)
+void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_running_ref, std::mutex& c_mutex_ref) {
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[VNC Downlink] Thread başlatıldı. Relay (Soket: " << sock_to_relay << ") dinleniyor." << std::endl;
+        std::cout << "[VNC Lib] libVNCclient başlatılıyor..." << std::endl;
+    }
+
+    rfbClient* client = rfbGetClient(8,3,4); // bitsPerPixel,depth,bytesPerPixel
+                                             // Bu değerler AllocFrameBuffer'da client->format ile ayarlanacak
+    if (!client) {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cerr << "[VNC Lib HATA] rfbGetClient başarısız!" << std::endl;
+        return;
+    }
+
+    client->MallocFrameBuffer = AllocFrameBuffer;
+    client->GotFrameBufferUpdate = GotFrameBufferUpdate;
+    client->GetPassword = GetPassword;
+    client->canHandleNewFBSize = TRUE;
+
+    client->sock = sock_to_relay;
+
+    if (!InitialiseRFBConnection(client)) {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cerr << "[VNC Lib HATA] InitialiseRFBConnection başarısız!" << std::endl;
+        rfbClientCleanup(client);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[VNC Lib] Bağlantı başlatıldı (InitialiseRFBConnection başarılı)." << std::endl;
+        // Düzeltildi: Anlaşılan protokol versiyonu için client->major ve client->minor
+        std::cout << "[VNC Lib] Anlaşılan RFB versiyonu: " << (int)client->major
+                  << "." << (int)client->minor << std::endl;
+        // Düzeltildi: Masaüstü adı için client->desktopName
+        std::cout << "[VNC Lib] Masaüstü Adı: "
+                  << (client->desktopName ? client->desktopName : "(yok)") << std::endl;
+        // Framebuffer boyutları için client->width ve client->height
+        std::cout << "[VNC Lib] Framebuffer: " << client->width
+                  << "x" << client->height << std::endl;
+    }
+
+    while (app_is_running_ref) {
+        int result = HandleRFBServerMessage(client);
+        if (result <= 0) {
+            std::lock_guard<std::mutex> lock(c_mutex_ref);
+            if (result < 0) { std::cerr << "[VNC Lib HATA] HandleRFBServerMessage hata verdi." << std::endl;}
+            else { std::cout << "[VNC Lib] Sunucu bağlantısı kapandı (HandleRFBServerMessage 0 döndü)." << std::endl; }
+            // app_is_running_ref = false; // Bu thread'in sonlanması ana app'i sonlandırmamalı, sadece bu döngüyü kır
+            break;
+        }
+        if (!client->frameBuffer) { // Framebuffer henüz hazır değilse kısa bekleme
+             std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    rfbClientCleanup(client);
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[VNC Downlink] Thread sonlandırıldı (libVNCclient temizlendi)." << std::endl;
+    }
+}
+
+// Sunucudan Gelen Mesajları İşleyen Ana Fonksiyon
+void process_server_message(const std::string& server_msg_line, std::string& my_id_ref, std::mutex& cout_mtx_param, int sock_to_server) {
+    std::lock_guard<std::mutex> lock(cout_mtx_param);
     std::stringstream ss(server_msg_line);
-    std::string msg_type;
-    ss >> msg_type;
+    std::string msg_type_original;
+    ss >> msg_type_original;
 
-    // Ham mesajı yazdırmayı isteğe bağlı yapabiliriz, bazen çok kalabalık olabilir.
+    std::string msg_type = msg_type_original;
+    std::transform(msg_type.begin(), msg_type.end(), msg_type.begin(), ::tolower); // Komutları küçük harfe çevir
+
     std::cout << "\n[Sunucu] " << server_msg_line << std::endl;
 
-    if (msg_type == "ID") {
-        ss >> my_id_ref; // Referans üzerinden my_id'yi güncelle
+    if (msg_type == "id") {
+        ss >> my_id_ref;
         std::cout << "[Bilgi] Size atanan ID: " << my_id_ref << std::endl;
-    } else if (msg_type == "INCOMING") {
-        std::string source_id;
-        ss >> source_id;
+    } else if (msg_type == "incoming") {
+        std::string source_id; ss >> source_id;
         std::cout << "----------------------------------------" << std::endl;
         std::cout << "[Bağlantı İsteği] ID '" << source_id << "' sizinle bağlanmak istiyor." << std::endl;
         std::cout << "Kabul etmek için: accept " << source_id << std::endl;
         std::cout << "Reddetmek için:   reject " << source_id << std::endl;
         std::cout << "----------------------------------------" << std::endl;
-    } else if (msg_type == "CONNECTING") {
-        std::string target_id;
-        ss >> target_id;
+    } else if (msg_type == "connecting") {
+        std::string target_id; ss >> target_id;
         std::cout << "[Bilgi] ID '" << target_id << "' hedefine bağlantı isteği gönderildi, yanıt bekleniyor..." << std::endl;
-    } else if (msg_type == "ACCEPTED") {
-        std::string peer_id;
-        ss >> peer_id;
-        std::cout << "[Bilgi] Bağlantı isteğiniz ID '" << peer_id << "' tarafından KABUL EDİLDİ." << std::endl;
-    } else if (msg_type == "REJECTED") {
-        std::string peer_id;
-        ss >> peer_id;
-        std::cout << "[Bilgi] Bağlantı isteğiniz ID '" << peer_id << "' tarafından REDDEDİLDİ." << std::endl;
-    } else if (msg_type == "CONNECTION_ESTABLISHED") {
-        std::string peer_id;
-        ss >> peer_id;
-        std::cout << "[Bilgi] ID '" << peer_id << "' ile BAĞLANTI KURULDU." << std::endl;
+    } else if (msg_type == "accepted") { // İstemci A (bağlanan)
+        std::string peer_id_b; ss >> peer_id_b; // Bu, accept eden İstemci B'nin ID'si
+        std::cout << "[Bilgi] Bağlantı isteğiniz ID '" << peer_id_b << "' tarafından KABUL EDİLDİ." << std::endl;
 
-        // VNC Sunucusunu Başlatmak İçin İlgili Fonksiyonu Çağır
-        // Bu fonksiyonun içindeki cout'lar da dışarıdaki mutex tarafından korunuyor.
-        start_vnc_server();
-
-    } else if (msg_type == "PEER_DISCONNECTED") {
-        std::string peer_id;
-        ss >> peer_id;
-        std::cout << "[Bilgi] ID '" << peer_id << "' bağlantısı KESİLDİ." << std::endl;
-    } else if (msg_type == "DISCONNECTED_OK") {
-         std::cout << "[Bilgi] Mevcut bağlantınız başarıyla sonlandırıldı." << std::endl;
-    } else if (msg_type == "MSG_FROM") {
-        std::string source_id;
-        ss >> source_id;
-        // Mesajın geri kalanını al (ilk iki kelimeden sonrasını)
-        std::string message_content;
-        std::string word1, word2;
-        ss >> word1 >> word2; // msg_type ve source_id'yi atla (zaten okundu)
-        std::getline(ss, message_content); // Satırın geri kalanını al
-        if (!message_content.empty() && message_content[0] == ' ') { // Başta boşluk varsa kaldır
-            message_content.erase(0, 1);
+        if (!send_server_message(sock_to_server, "start_vnc_tunnel")) { // Küçük harf
+            std::cerr << "[HATA] Sunucuya 'start_vnc_tunnel' gönderilemedi (Agent A)." << std::endl;
+        } else {
+            std::cout << "[Bilgi] Sunucuya 'start_vnc_tunnel' komutu gönderildi (Agent A)." << std::endl;
         }
+        
+        // VNC downlink thread'i TUNNEL_ACTIVE mesajı gelince başlatılacak.
+        client_a_waiting_for_tunnel_activation = true; // client_main.cpp'de tanımlı global
+        std::cout << "[Bilgi] VNC Downlink (libVNCclient) thread'i için sunucudan TUNNEL_ACTIVE bekleniyor..." << std::endl;
+
+    } else if (msg_type == "rejected") {
+        std::string peer_id; ss >> peer_id;
+        std::cout << "[Bilgi] Bağlantı isteğiniz ID '" << peer_id << "' tarafından REDDEDİLDİ." << std::endl;
+        client_a_waiting_for_tunnel_activation = false; // Reddedildiyse bekleme
+    } else if (msg_type == "connection_established") { // İstemci B (kabul eden)
+        std::string peer_id_a; ss >> peer_id_a; // Bu, istek yapan İstemci A'nın ID'si
+        std::cout << "[Bilgi] ID '" << peer_id_a << "' ile BAĞLANTI KURULDU." << std::endl;
+        
+        std::cout << "[DEBUG_PROCESS] start_vnc_server() çağrılmadan hemen önce." << std::endl;
+        start_vnc_server();
+        std::cout << "[DEBUG_PROCESS] start_vnc_server() çağrıldıktan hemen sonra." << std::endl;
+        
+        const int VNC_START_DELAY_SECONDS = 3;
+        std::cout << "[DEBUG_PROCESS] Yerel VNC sunucusunun başlaması için " << VNC_START_DELAY_SECONDS << " saniye bekleniyor..." << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(VNC_START_DELAY_SECONDS));
+        std::cout << "[DEBUG_PROCESS] Bekleme tamamlandı." << std::endl;
+        
+        std::cout << "[Tünel-Adım1] Yerel VNC sunucusuna (127.0.0.1:5900) bağlanmayı deneniyor..." << std::endl;
+        int local_vnc_sock = -1; struct sockaddr_in local_vnc_addr;
+        const char* LOCAL_VNC_IP = "127.0.0.1"; const int LOCAL_VNC_PORT = 5900;
+        
+        local_vnc_sock = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (local_vnc_sock < 0) { perror("[HATA] Yerel VNC soketi oluşturulamadı"); }
+        else {
+            memset(&local_vnc_addr, 0, sizeof(local_vnc_addr));
+            local_vnc_addr.sin_family = AF_INET; local_vnc_addr.sin_port = htons(LOCAL_VNC_PORT);
+            if (inet_pton(AF_INET, LOCAL_VNC_IP, &local_vnc_addr.sin_addr) <= 0) { 
+                perror(("[HATA] Geçersiz yerel VNC IP adresi: " + std::string(LOCAL_VNC_IP)).c_str()); 
+                ::close(local_vnc_sock); local_vnc_sock = -1;
+            } else {
+                std::cout << "[DEBUG] Yerel VNC'ye connect() çağrılıyor..." << std::endl;
+                if (::connect(local_vnc_sock, (struct sockaddr *)&local_vnc_addr, sizeof(local_vnc_addr)) < 0) { 
+                    perror(("[HATA] Yerel VNC sunucusuna bağlanılamadı (" + std::string(LOCAL_VNC_IP) + ":" + std::to_string(LOCAL_VNC_PORT) + ")").c_str()); 
+                    std::cerr << "       - VNC sunucusu (" << LOCAL_VNC_IP << ":" << LOCAL_VNC_PORT << ") gerçekten başlatıldı ve çalışıyor mu?" << std::endl; 
+                    ::close(local_vnc_sock); local_vnc_sock = -1;
+                } else {
+                    std::cout << "[Bilgi] Yerel VNC sunucusuna başarıyla bağlanıldı (Soket: " << local_vnc_sock << ")." << std::endl;
+                    std::cout << "[Bilgi] VNC uplink thread'i başlatılıyor..." << std::endl;
+                    std::thread vnc_up_thread(vnc_uplink_thread_func, local_vnc_sock, sock_to_server, std::ref(running), std::ref(cout_mtx_param));
+                    vnc_up_thread.detach();
+                }
+            }
+        }
+        std::cout << "       (İpucu: İstemci A tarafında VNC Görüntüleyici (dahili) başlayacak.)" << std::endl;
+        std::cout << "       Bağlantıyı bitirmek için 'disconnect' komutunu kullanın." << std::endl;
+    }
+    else if (msg_type == "tunnel_active") {
+        std::cout << "[Bilgi] Sunucu VNC tünelinin aktif olduğunu bildirdi." << std::endl;
+        if (client_a_waiting_for_tunnel_activation) { // client_main.cpp'de tanımlı global
+            client_a_waiting_for_tunnel_activation = false;
+            std::cout << "[Bilgi] TUNNEL_ACTIVE alındı, VNC Downlink (libVNCclient) thread'i başlatılıyor..." << std::endl;
+            std::thread vnc_session_thread(vnc_downlink_thread_func, sock_to_server, std::ref(running), std::ref(cout_mtx_param));
+            vnc_session_thread.detach();
+        }
+    } else if (msg_type == "peer_disconnected") { 
+        std::string peer_id; ss >> peer_id; 
+        std::cout << "[Bilgi] ID '" << peer_id << "' bağlantısı KESİLDİ." << std::endl; 
+        client_a_waiting_for_tunnel_activation = false; // Eğer bekliyorsa artık beklemesin
+        // TODO: Aktif VNC thread'lerini (uplink/downlink) burada sonlandırmak için bir flag veya mekanizma.
+        // 'running' flag'i zaten genel olarak bunu yapar ama daha spesifik bir session flag'i olabilir.
+    } else if (msg_type == "disconnected_ok") { 
+        std::cout << "[Bilgi] Mevcut bağlantınız başarıyla sonlandırıldı." << std::endl; 
+        client_a_waiting_for_tunnel_activation = false;
+        // TODO: Aktif VNC thread'lerini sonlandır.
+    } else if (msg_type == "msg_from") { 
+        std::string source_id; ss >> source_id;
+        std::string message_content; std::getline(ss, message_content);
+        if(!message_content.empty() && message_content[0] == ' ') message_content.erase(0,1);
         std::cout << "[Mesaj (" << source_id << ")] " << message_content << std::endl;
-    } else if (msg_type == "ERROR") {
-         std::string error_message;
-         std::getline(ss, error_message); // Hata mesajının geri kalanını al
-         if (!error_message.empty() && error_message[0] == ' ') { error_message.erase(0, 1); }
-         std::cerr << "[Sunucu Hatası] " << error_message << std::endl;
-    } else if (msg_type == "LIST_BEGIN") {
-         std::cout << "--- Bağlı İstemciler Listesi ---" << std::endl;
-    } else if (msg_type == "LIST_END") {
-         std::cout << "--------------------------------" << std::endl;
-    } else if (server_msg_line.rfind("ID: ", 0) == 0) { // LIST içeriği için basit kontrol
+    } else if (msg_type == "error") { 
+        std::string error_message; std::getline(ss, error_message);
+        if(!error_message.empty() && error_message[0] == ' ') error_message.erase(0,1);
+        std::cerr << "[Sunucu Hatası] " << error_message << std::endl;
+    } else if (msg_type == "list_begin") { std::cout << "--- Bağlı İstemciler Listesi ---" << std::endl; }
+    else if (msg_type == "list_end") { std::cout << "--------------------------------" << std::endl; }
+    else if (msg_type_original.rfind("ID: ", 0) == 0 ) { // LIST içeriği için orijinal msg_type_original (büyük harf 'ID:')
          std::cout << "  " << server_msg_line << std::endl;
     } else {
-        // Bilinmeyen mesaj türü - Ham log yeterli olabilir.
-        // std::cerr << "[Uyarı] Bilinmeyen sunucu mesajı türü: " << msg_type << std::endl;
+        // std::cerr << "[Uyarı] Bilinmeyen sunucu mesajı: " << server_msg_line << std::endl;
     }
 
-    // Yeni komut istemini yazdır
     std::cout << "> ";
     std::cout.flush();
 }

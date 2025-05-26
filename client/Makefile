@@ -2,11 +2,14 @@
 CXX = g++
 
 # Derleyici bayrakları:
-# -std=c++11 : C++11 standardını kullan
+# -std=c++17 : C++17 standardını kullan
 # -Iinclude  : Başlık dosyaları için 'include' klasörünü ekle
 # -Wall      : Tüm uyarıları göster
 # -g         : Hata ayıklama bilgilerini ekle (isteğe bağlı)
 CXXFLAGS = -std=c++17 -Iinclude -Wall -g
+
+# Linker bayrakları (Kütüphaneler buraya eklenir)
+LDFLAGS = -pthread -lvncclient # <--- DEĞİŞİKLİK BURADA
 
 # Çalıştırılabilir dosyanın adı
 TARGET = program
@@ -29,8 +32,8 @@ all: $(TARGET)
 # Nesne dosyalarını birbirine bağlar
 $(TARGET): $(OBJECTS)
 	@echo "Linking..."
-	@mkdir -p $(dir $@) # Eğer ana dizinde oluşturuluyorsa gerek yok ama genelde bin/ dizini için kullanılır.
-	$(CXX) $(CXXFLAGS) $^ -o $@
+	# @mkdir -p $(dir $@) # 'program' ana dizinde olacağı için bu satıra gerek yok.
+	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS) # <--- DEĞİŞİKLİK BURADA (LDFLAGS eklendi)
 	@echo "Build finished: $(TARGET)"
 
 # Nesne dosyalarını derleme kuralı (*.cpp -> obj/*.o)
@@ -47,4 +50,3 @@ clean:
 
 # Dosya olmayan hedefleri belirtir
 .PHONY: all clean
-
