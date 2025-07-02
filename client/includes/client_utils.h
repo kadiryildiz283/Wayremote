@@ -57,10 +57,11 @@ void vnc_uplink_thread_func(int local_vnc_fd,
  * @param app_is_running_ref Ana uygulamanın genel çalışma durumunu gösteren atomik boolean'a referans.
  * @param c_mutex_ref Konsol çıktıları için paylaşılan mutex'e referans.
  */
-void vnc_downlink_thread_func(int sock_to_relay,
-                              std::atomic<bool>& app_is_running_ref,
-                              std::mutex& c_mutex_ref);
 
+void vnc_control_downlink_thread_func(int local_vnc_fd,
+                                      int sock_to_relay,
+                                      std::atomic<bool>& app_is_running_ref,
+                                      std::mutex& c_mutex_ref);
 // manage_vnc_proxy_session_thread fonksiyonu, libVNCclient'in doğrudan entegrasyonuyla
 // şimdilik gereksiz hale geldiği için kaldırıldı. Eğer İstemci A'nın ayrı bir
 // yerel VNC proxy sunucusu gibi davranması istenirse tekrar eklenebilir.

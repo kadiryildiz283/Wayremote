@@ -17,8 +17,9 @@ int sock = 0;
 std::string my_id = "UNKNOWN";
 std::atomic<bool> running(true);
 std::mutex cout_mutex;
+std::atomic<bool> client_a_waiting_for_tunnel_activation(false);
+std::atomic<bool> client_a_vnc_data_mode_active(false); //// Sinyal işleyici
 
-// Sinyal işleyici
 void signal_handler(int signum) {
    {
       std::lock_guard<std::mutex> lock(cout_mutex);
@@ -40,61 +41,40 @@ void receive_messages_thread_func() {
     std::string partial_message;
     std::string current_line;
 
-    while (running) {
-        // Eğer soket geçerli değilse (örn. signal_handler kapattıysa) thread'i sonlandır
-        if (sock <= 0) {
-             running = false; // Diğer döngüleri de durdur
-             break;
-        }
+    // DÖNGÜ KOŞULU GÜNCELLENDİ
+    while (running && !client_a_vnc_data_mode_active) {
+        if (sock <= 0) { running = false; break; }
 
         memset(buffer, 0, sizeof(buffer));
-        ssize_t bytes_read = read(sock, buffer, sizeof(buffer) - 1);
+        ssize_t bytes_read = ::read(sock, buffer, sizeof(buffer) - 1);
 
         if (bytes_read <= 0) {
-            if (running) {
-                 // Bağlantının diğer uçtan veya bir hatadan dolayı kapandığını belirt
-                 std::lock_guard<std::mutex> lock(cout_mutex);
-                 if (bytes_read == 0) {
-                     std::cerr << "\n[Hata] Sunucu bağlantısı kapandı." << std::endl;
-                 } else {
-                     // read sırasında bir hata oluştu (sock kapanmış olabilir)
-                     // perror("receive_messages_thread_func - read hatası"); // Daha detaylı hata için
-                      std::cerr << "\n[Hata] Sunucudan okuma hatası (bağlantı kopmuş olabilir)." << std::endl;
-                 }
-                 std::cout << "Çıkmak için Enter'a basın..." << std::endl;
-
-            }
-            running = false; // Ana döngünün ve diğer işlemlerin durmasını sağla
-            // Soketi burada tekrar kapatmaya çalışmak yerine signal_handler'a bırakmak daha iyi olabilir
-            // if (sock > 0) { close(sock); sock = -1; }
+            // ... (hata ve bağlantı kopma logları) ...
+            running = false;
             break;
         }
 
         partial_message += buffer;
         size_t newline_pos;
+        
+        // İkinci while koşulu da güncellendi
+        while (running && !client_a_vnc_data_mode_active && (newline_pos = partial_message.find('\n')) != std::string::npos) {
+            current_line = partial_message.substr(0, newline_pos);
+            partial_message.erase(0, newline_pos + 1);
+            if (!current_line.empty()) {
+                process_server_message(current_line, my_id, cout_mutex, sock);
+            }
+        }
+    } // Ana while döngüsü sonu
 
-        // Birden fazla mesaj gelmiş olabilir, hepsini işle
-        while (running && (newline_pos = partial_message.find('\n')) != std::string::npos) {
-             current_line = partial_message.substr(0, newline_pos);
-             partial_message.erase(0, newline_pos + 1);
-             if (!current_line.empty()) {
-                 // İşleme fonksiyonunu çağır (my_id'yi referansla ver, sock'ı ekle)
-                 // ---- DÜZELTME BURADA ----
-                 process_server_message(current_line, my_id, cout_mutex, sock);
-                 // ------------------------
-             }
+    { // Thread sonlanma logu
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        if (client_a_vnc_data_mode_active) {
+            std::cout << "\n[Bilgi] Ana mesaj alıcı thread VNC veri modu nedeniyle durduruldu. Soket libVNCclient'e devredildi." << std::endl;
+        } else {
+            std::cout << "\n[Bilgi] Sunucu dinleme thread'i sonlandırıldı." << std::endl;
         }
     }
-     {
-        std::lock_guard<std::mutex> lock(cout_mutex);
-        // Thread'in neden sonlandığını belirtmek faydalı olabilir
-        if(sock <= 0 && running) { // Eğer soket kapandıysa ama running flag'i başka yerden değişmediyse
-             std::cout << "\n[Bilgi] Soket kapandığı için sunucu dinleme thread'i sonlandırılıyor." << std::endl;
-        } else {
-             std::cout << "\n[Bilgi] Sunucu dinleme thread'i sonlandırıldı." << std::endl;
-        }
-
-     }
 }
 
 

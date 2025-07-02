@@ -13,7 +13,8 @@
 #include <cstdio>    // perror()
 #include <cstring>   // memset(), strdup()
 #include <cstdint>   // uint8_t için
-
+#include <SDL2/SDL.h>     // SDL2 ana başlık dosyası
+#include <sys/select.h>   // select() fonksiyonu için
 // Ağ işlemleri için
 #include <sys/socket.h>
 #include <netinet/in.h> // sockaddr_in, htons
@@ -27,14 +28,13 @@
 
 // libVNCclient başlık dosyası
 #include <rfb/rfbclient.h>
-
+extern std::atomic<bool> client_a_waiting_for_tunnel_activation;
+extern std::atomic<bool> client_a_vnc_data_mode_active; // YENİ EXTERN
 // --- Global Değişkenlere Erişim (client_main.cpp'de tanımlı olanlar) ---
 extern std::atomic<bool> running;
 extern std::mutex cout_mutex;
 // İstemci A'nın TUNNEL_ACTIVE bekleme durumu için (client_main.cpp'de tanımlı)
 extern std::atomic<bool> client_a_waiting_for_tunnel_activation;
-std::atomic<bool> client_a_waiting_for_tunnel_activation(false); // <<-- BU SATIRI EKLEYİN VEYA KONTROL EDİN
-
 // --- libVNCclient için Global Framebuffer ve Yardımcılar ---
 static std::vector<uint8_t> g_vnc_framebuffer_storage;
 static int g_vnc_fb_width = 0;
@@ -149,11 +149,26 @@ void start_vnc_server() {
         if (session_type_str == "wayland") {
             command_to_run_str = "wayvnc";
             if (command_exists(command_to_run_str)) {
-                std::cout << "[Bilgi] 'wayvnc' bulundu. Argümanlar hazırlanıyor..." << std::endl;
-                argv_list = new char*[3];
-                argv_list[0] = strdup("wayvnc"); argv_list[1] = strdup("127.0.0.1"); argv_list[2] = NULL;
+
+std::cout << "[Bilgi] 'wayvnc' bulundu. Argümanlar hazırlanıyor..." << std::endl;
+                
+                std::string socket_path = "/tmp/wayvnc_sock_" + std::to_string(getpid());
+                std::cout << "[DEBUG] wayvnc için kullanılacak benzersiz soket yolu: " << socket_path << std::endl;
+
+                // --- DEĞİŞİKLİK: Debug parametresi '-d' eklendi ---
+                argv_list = new char*[6]; // "wayvnc", "-d", "127.0.0.1", "-S", <yol>, NULL için 6 eleman
+                argv_list[0] = strdup("wayvnc");
+                argv_list[1] = strdup("-d"); // DEBUG parametresi
+                argv_list[2] = strdup("127.0.0.1");
+                argv_list[3] = strdup("-S");
+                argv_list[4] = strdup(socket_path.c_str());
+                argv_list[5] = NULL;
+                // --- DEĞİŞİKLİK SONU ---
+                
                 proceed_to_execute = true;
-            } else { std::cerr << "[HATA] 'wayvnc' komutu bulunamadı! Lütfen kurun." << std::endl; }
+           } else {
+                std::cerr << "[HATA] 'wayvnc' komutu bulunamadı! Lütfen kurun." << std::endl;
+            }           
         } else if (session_type_str == "x11") {
             command_to_run_str = "x11vnc";
             if (command_exists(command_to_run_str)) {
@@ -248,7 +263,56 @@ void vnc_uplink_thread_func(int local_vnc_fd, int sock_to_relay, std::atomic<boo
     { std::lock_guard<std::mutex> lock(c_mutex_ref); std::cout << "[VNC Uplink] Thread sonlandırıldı." << std::endl; }
 }
 
-// VNC Downlink Thread Fonksiyonu (İstemci A - Sunucudan Gelen VNC Verisini İşler)
+void vnc_control_downlink_thread_func(int local_vnc_fd, int sock_to_relay, std::atomic<bool>& app_is_running_ref, std::mutex& c_mutex_ref) {
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[VNC Downlink(B)] Thread başlatıldı. Relay (Soket: " << sock_to_relay
+                  << ") dinleniyor. Hedef: Yerel VNC (Soket: " << local_vnc_fd << ")" << std::endl;
+    }
+
+    std::vector<char> buffer(8192);
+    ssize_t bytes_read;
+    ssize_t bytes_sent;
+
+    while (app_is_running_ref) {
+        // 1. Relay sunucusundan veri oku (bu, İstemci A'dan gelen kontrol verisidir)
+        bytes_read = ::read(sock_to_relay, buffer.data(), buffer.size());
+
+        if (bytes_read > 0) {
+            {
+                std::lock_guard<std::mutex> lock(c_mutex_ref);
+                std::cout << "[VNC Downlink(B)] Relay sunucusundan " << bytes_read << " byte kontrol verisi alındı. Yerel VNC'ye gönderiliyor..." << std::endl;
+            }
+
+            // 2. Okunan veriyi yerel VNC sunucusuna yaz
+            bytes_sent = ::send(local_vnc_fd, buffer.data(), bytes_read, 0);
+            if (bytes_sent < 0) {
+                std::lock_guard<std::mutex> lock(c_mutex_ref);
+                perror("[VNC Downlink(B)] Yerel VNC'ye veri gönderme hatası");
+                break; // Hata durumunda döngüyü sonlandır
+            } else if (bytes_sent < bytes_read) {
+                std::lock_guard<std::mutex> lock(c_mutex_ref);
+                std::cerr << "[VNC Downlink(B)] UYARI: Yerel VNC'ye tüm veri gönderilemedi." << std::endl;
+            }
+
+        } else if (bytes_read == 0) {
+            std::lock_guard<std::mutex> lock(c_mutex_ref);
+            std::cout << "[VNC Downlink(B)] Relay sunucusu bağlantısı kapandı." << std::endl;
+            break;
+        } else { // Hata
+            if (errno == EINTR) { continue; } // Sinyal kesintisi, devam et
+            std::lock_guard<std::mutex> lock(c_mutex_ref);
+            perror("[VNC Downlink(B)] Relay sunucusundan okuma hatası");
+            break;
+        }
+    }
+    // Bu thread sonlandığında, muhtemelen tüm VNC oturumu bitmiştir.
+    // Soketler diğer thread veya ana program tarafından kapatılacaktır.
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[VNC Downlink(B)] Thread sonlandırıldı." << std::endl;
+    }
+}
 void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_running_ref, std::mutex& c_mutex_ref) {
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
@@ -256,8 +320,7 @@ void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_runni
         std::cout << "[VNC Lib] libVNCclient başlatılıyor..." << std::endl;
     }
 
-    rfbClient* client = rfbGetClient(8,3,4); // bitsPerPixel,depth,bytesPerPixel
-                                             // Bu değerler AllocFrameBuffer'da client->format ile ayarlanacak
+    rfbClient* client = rfbGetClient(8,3,4);
     if (!client) {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
         std::cerr << "[VNC Lib HATA] rfbGetClient başarısız!" << std::endl;
@@ -268,7 +331,6 @@ void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_runni
     client->GotFrameBufferUpdate = GotFrameBufferUpdate;
     client->GetPassword = GetPassword;
     client->canHandleNewFBSize = TRUE;
-
     client->sock = sock_to_relay;
 
     if (!InitialiseRFBConnection(client)) {
@@ -281,37 +343,97 @@ void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_runni
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
         std::cout << "[VNC Lib] Bağlantı başlatıldı (InitialiseRFBConnection başarılı)." << std::endl;
-        // Düzeltildi: Anlaşılan protokol versiyonu için client->major ve client->minor
-        std::cout << "[VNC Lib] Anlaşılan RFB versiyonu: " << (int)client->major
-                  << "." << (int)client->minor << std::endl;
-        // Düzeltildi: Masaüstü adı için client->desktopName
-        std::cout << "[VNC Lib] Masaüstü Adı: "
-                  << (client->desktopName ? client->desktopName : "(yok)") << std::endl;
-        // Framebuffer boyutları için client->width ve client->height
-        std::cout << "[VNC Lib] Framebuffer: " << client->width
-                  << "x" << client->height << std::endl;
+        std::cout << "[VNC Lib] Anlaşılan RFB versiyonu: " << (int)client->major << "." << (int)client->minor << std::endl;
+        std::cout << "[VNC Lib] Masaüstü Adı: " << (client->desktopName ? client->desktopName : "(yok)") << std::endl;
+        std::cout << "[VNC Lib] Framebuffer: " << client->width << "x" << client->height << std::endl;
     }
 
+    // --- YENİ KISIM: SDL Penceresi Oluşturma ---
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cerr << "[SDL HATA] SDL başlatılamadı: " << SDL_GetError() << std::endl;
+        rfbClientCleanup(client);
+        return;
+    }
+
+    SDL_Window* window = SDL_CreateWindow(
+        (std::string("Uzak Masaüstü: ") + (client->desktopName ? client->desktopName : "")).c_str(), // Pencere başlığı
+        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, // Pencere konumu
+        client->width, client->height, // Boyutlar libVNCclient'ten
+        SDL_WINDOW_SHOWN // Pencere gösterilsin
+    );
+
+    if (!window) {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cerr << "[SDL HATA] Pencere oluşturulamadı: " << SDL_GetError() << std::endl;
+        SDL_Quit();
+        rfbClientCleanup(client);
+        return;
+    }
+    
+    // Şimdilik sadece boş bir pencere açıyoruz.
+    // Sonraki adımda renderer ve texture oluşturup framebuffer'ı çizeceğiz.
+
+    // --- Ana Olay ve Mesaj Döngüsü ---
+    SDL_Event event;
     while (app_is_running_ref) {
-        int result = HandleRFBServerMessage(client);
-        if (result <= 0) {
+        // 1. SDL olaylarını işle (kullanıcının pencereyi kapatması gibi)
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) {
+                {
+                    std::lock_guard<std::mutex> lock(c_mutex_ref);
+                    std::cout << "[SDL Bilgi] Pencere kapatma isteği alındı. Program sonlandırılıyor." << std::endl;
+                }
+                app_is_running_ref = false; // Ana programın kapanmasını tetikle
+            }
+            // TODO (Adım 2a): Klavye ve fare olaylarını burada yakalayacağız.
+        }
+
+        // 2. VNC soketinde okunacak veri var mı diye kontrol et (engellemesiz)
+        fd_set fds;
+        struct timeval tv;
+        int ret;
+
+        FD_ZERO(&fds);
+        FD_SET(client->sock, &fds);
+        tv.tv_sec = 0; // Bekleme yapma
+        tv.tv_usec = 1000; // 1 milisaniye timeout (çok kısa)
+
+        ret = select(client->sock + 1, &fds, NULL, NULL, &tv);
+        if (ret == -1) {
             std::lock_guard<std::mutex> lock(c_mutex_ref);
-            if (result < 0) { std::cerr << "[VNC Lib HATA] HandleRFBServerMessage hata verdi." << std::endl;}
-            else { std::cout << "[VNC Lib] Sunucu bağlantısı kapandı (HandleRFBServerMessage 0 döndü)." << std::endl; }
-            // app_is_running_ref = false; // Bu thread'in sonlanması ana app'i sonlandırmamalı, sadece bu döngüyü kır
-            break;
+            perror("[VNC Downlink HATA] select() hatası");
+            app_is_running_ref = false; // Ciddi hata, çık
+        } else if (ret > 0) { // Sokette okunacak veri var
+            int result = HandleRFBServerMessage(client); // Veriyi işle
+            if (result <= 0) {
+                 std::lock_guard<std::mutex> lock(c_mutex_ref);
+                 if (result < 0) { std::cerr << "[VNC Lib HATA] HandleRFBServerMessage hata verdi." << std::endl; }
+                 else { std::cout << "[VNC Lib] Sunucu bağlantısı kapandı." << std::endl; }
+                 app_is_running_ref = false; // Bağlantı koptu, çık
+            }
         }
-        if (!client->frameBuffer) { // Framebuffer henüz hazır değilse kısa bekleme
-             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
+        // Eğer ret == 0 ise, timeout oldu, okunacak veri yok. Döngü devam eder.
+
+        // 3. Ekrana çizim yap (şimdilik sadece arkaplanı temizle)
+        // Sonraki adımda buraya texture çizimi gelecek.
+
+        // Kısa bir bekleme (CPU'yu %100 kullanmamak için)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    // --- Temizlik ---
+    if (window) {
+        SDL_DestroyWindow(window);
+    }
+    SDL_Quit();
     rfbClientCleanup(client);
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[VNC Downlink] Thread sonlandırıldı (libVNCclient temizlendi)." << std::endl;
+        std::cout << "[VNC Downlink] Thread sonlandırıldı (SDL ve libVNCclient temizlendi)." << std::endl;
     }
 }
+
 
 // Sunucudan Gelen Mesajları İşleyen Ana Fonksiyon
 void process_server_message(const std::string& server_msg_line, std::string& my_id_ref, std::mutex& cout_mtx_param, int sock_to_server) {
@@ -388,10 +510,21 @@ void process_server_message(const std::string& server_msg_line, std::string& my_
                     std::cerr << "       - VNC sunucusu (" << LOCAL_VNC_IP << ":" << LOCAL_VNC_PORT << ") gerçekten başlatıldı ve çalışıyor mu?" << std::endl; 
                     ::close(local_vnc_sock); local_vnc_sock = -1;
                 } else {
-                    std::cout << "[Bilgi] Yerel VNC sunucusuna başarıyla bağlanıldı (Soket: " << local_vnc_sock << ")." << std::endl;
-                    std::cout << "[Bilgi] VNC uplink thread'i başlatılıyor..." << std::endl;
+                                  std::cout << "[Bilgi] Yerel VNC sunucusuna başarıyla bağlanıldı (Soket: " << local_vnc_sock << ")." << std::endl;
+                    
+                    // --- DEĞİŞİKLİK BURADA: İKİ THREAD'İ DE BAŞLAT ---
+                    std::cout << "[Bilgi] İki yönlü VNC tünel thread'leri başlatılıyor..." << std::endl;
+                    
+                    // Uplink Thread (Yerel VNC -> Relay Sunucusu)
                     std::thread vnc_up_thread(vnc_uplink_thread_func, local_vnc_sock, sock_to_server, std::ref(running), std::ref(cout_mtx_param));
+                    
+                    // Downlink Thread (Relay Sunucusu -> Yerel VNC)
+                    std::thread vnc_down_thread(vnc_control_downlink_thread_func, local_vnc_sock, sock_to_server, std::ref(running), std::ref(cout_mtx_param));
+                    
+                    // Thread'leri ayır, kendi başlarına çalışsınlar
                     vnc_up_thread.detach();
+                    vnc_down_thread.detach();
+                    
                 }
             }
         }
@@ -402,10 +535,12 @@ void process_server_message(const std::string& server_msg_line, std::string& my_
         std::cout << "[Bilgi] Sunucu VNC tünelinin aktif olduğunu bildirdi." << std::endl;
         if (client_a_waiting_for_tunnel_activation) { // client_main.cpp'de tanımlı global
             client_a_waiting_for_tunnel_activation = false;
+        }
+            client_a_vnc_data_mode_active = true;
+            // Şimdi libVNCclient thread'ini başlat, soket artık onun.
             std::cout << "[Bilgi] TUNNEL_ACTIVE alındı, VNC Downlink (libVNCclient) thread'i başlatılıyor..." << std::endl;
             std::thread vnc_session_thread(vnc_downlink_thread_func, sock_to_server, std::ref(running), std::ref(cout_mtx_param));
             vnc_session_thread.detach();
-        }
     } else if (msg_type == "peer_disconnected") { 
         std::string peer_id; ss >> peer_id; 
         std::cout << "[Bilgi] ID '" << peer_id << "' bağlantısı KESİLDİ." << std::endl; 
