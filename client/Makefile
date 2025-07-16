@@ -9,7 +9,7 @@ CXX = g++
 CXXFLAGS = -std=c++17 -Iinclude -Wall -g
 
 # Linker bayrakları (Kütüphaneler buraya eklenir)
-LDFLAGS = -pthread -lvncclient -lSDL2 # <--- DEĞİŞİKLİK BURADA
+LDFLAGS = -pthread -lvncclient -lSDL2 -lpthread # <--- DEĞİŞİKLİK BURADA
 
 # Çalıştırılabilir dosyanın adı
 TARGET = program

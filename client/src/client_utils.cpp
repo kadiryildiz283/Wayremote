@@ -1,5 +1,5 @@
 #include "../includes/client_utils.h" // Kendi başlık dosyamız
-
+#include "../includes/vnc_viewer.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -20,6 +20,7 @@
 #include <netinet/in.h> // sockaddr_in, htons
 #include <arpa/inet.h>  // inet_pton, inet_ntoa
 #include <unistd.h>     // ::read, ::send, ::close, fork, execvp, _exit (POSIX)
+#include <rfb/rfbclient.h>
 
 #ifndef _WIN32
 #include <sys/types.h>  // pid_t
@@ -27,7 +28,6 @@
 #endif
 
 // libVNCclient başlık dosyası
-#include <rfb/rfbclient.h>
 extern std::atomic<bool> client_a_waiting_for_tunnel_activation;
 extern std::atomic<bool> client_a_vnc_data_mode_active; // YENİ EXTERN
 // --- Global Değişkenlere Erişim (client_main.cpp'de tanımlı olanlar) ---
@@ -41,6 +41,26 @@ static int g_vnc_fb_width = 0;
 static int g_vnc_fb_height = 0;
 static unsigned int g_vnc_client_bpp = 0;
 static unsigned int g_vnc_client_depth = 0;
+
+
+
+// Yeni bir frame'in çizim için hazır olduğunu bildiren atomik flag
+static std::atomic<bool> g_new_frame_ready(false);
+
+// --- DEĞİŞTİ ---
+static void GotFrameBufferUpdate(rfbClient* client, int x, int y, int w, int h) {
+    // Bu callback, libvncclient'ın kendi thread'i tarafından çağrılabilir.
+    // Bu yüzden burada sadece bir flag ayarlayıp çıkmak en güvenlisidir.
+    // Tüm çizim işlemleri ana thread'de (vnc_downlink_thread_func'ın döngüsü) yapılacak.
+    g_new_frame_ready = true;
+    
+    // Debug için loglamayı bırakabiliriz, ama çok sık çağrılacağı için performansı etkileyebilir.
+    // std::lock_guard<std::mutex> lock(cout_mutex);
+    // std::cout << "[VNC Lib] GotFrameBufferUpdate: x=" << x << ", y=" << y << ", w=" << w << ", h=" << h << std::endl;
+}
+
+
+
 
 // --- libVNCclient Callback Fonksiyonları ---
 static rfbBool AllocFrameBuffer(rfbClient* client) {
@@ -77,13 +97,6 @@ static rfbBool AllocFrameBuffer(rfbClient* client) {
     }
     return FALSE;
 }
-
-static void GotFrameBufferUpdate(rfbClient* client, int x, int y, int w, int h) {
-    std::lock_guard<std::mutex> lock(cout_mutex);
-    std::cout << "[VNC Lib] GotFrameBufferUpdate: x=" << x << ", y=" << y << ", w=" << w << ", h=" << h << std::endl;
-    // TODO (SDL): Burada client->frameBuffer içindeki güncellenmiş piksel verisini SDL ile ekrana çiz.
-}
-
 static char* GetPassword(rfbClient* client) {
     std::lock_guard<std::mutex> lock(cout_mutex);
     std::cout << "[VNC Lib] GetPassword çağrıldı. Şifresiz devam ediliyor." << std::endl;
@@ -146,30 +159,29 @@ void start_vnc_server() {
         session_type_str = session_type_env ? session_type_env : "unknown";
         std::cout << "[Bilgi] Oturum Türü (XDG_SESSION_TYPE): " << session_type_str << std::endl;
 
-        if (session_type_str == "wayland") {
-            command_to_run_str = "wayvnc";
-            if (command_exists(command_to_run_str)) {
-
-std::cout << "[Bilgi] 'wayvnc' bulundu. Argümanlar hazırlanıyor..." << std::endl;
+       
+              if (session_type_str == "wayland") {
+                command_to_run_str = "/bin/bash"; 
                 
-                std::string socket_path = "/tmp/wayvnc_sock_" + std::to_string(getpid());
-                std::cout << "[DEBUG] wayvnc için kullanılacak benzersiz soket yolu: " << socket_path << std::endl;
+                if (command_exists("wayvnc")) { // Kontrol hala wayvnc için yapılıyor
+                    std::cout << "[Bilgi] 'wayvnc' bulundu. /bin/bash aracılığıyla başlatılacak..." << std::endl;
 
-                // --- DEĞİŞİKLİK: Debug parametresi '-d' eklendi ---
-                argv_list = new char*[6]; // "wayvnc", "-d", "127.0.0.1", "-S", <yol>, NULL için 6 eleman
-                argv_list[0] = strdup("wayvnc");
-                argv_list[1] = strdup("-d"); // DEBUG parametresi
-                argv_list[2] = strdup("127.0.0.1");
-                argv_list[3] = strdup("-S");
-                argv_list[4] = strdup(socket_path.c_str());
-                argv_list[5] = NULL;
-                // --- DEĞİŞİKLİK SONU ---
-                
-                proceed_to_execute = true;
-           } else {
-                std::cerr << "[HATA] 'wayvnc' komutu bulunamadı! Lütfen kurun." << std::endl;
-            }           
-        } else if (session_type_str == "x11") {
+                    // --- DEĞİŞİKLİK BURADA: Argüman listesini /bin/bash için hazırlıyoruz ---
+                    // "/bin/bash", "-c", "wayvnc", NULL
+                    // -c parametresi, bash'e tırnak içindeki komutu çalıştırmasını söyler.
+                    argv_list = new char*[4];
+                    argv_list[0] = strdup("/bin/bash");
+                    argv_list[1] = strdup("-c");
+                    argv_list[2] = strdup("wayvnc");
+                    argv_list[3] = NULL;
+                    // --- DEĞİŞİKLİK SONU ---
+
+                    proceed_to_execute = true;
+                } else {
+                    std::cerr << "[HATA] 'wayvnc' komutu bulunamadı! Lütfen kurun." << std::endl;
+                }
+            }
+            else if (session_type_str == "x11") {
             command_to_run_str = "x11vnc";
             if (command_exists(command_to_run_str)) {
                 std::cout << "[Bilgi] 'x11vnc' bulundu. Argümanlar hazırlanıyor..." << std::endl;
@@ -182,6 +194,14 @@ std::cout << "[Bilgi] 'wayvnc' bulundu. Argümanlar hazırlanıyor..." << std::e
         } else { std::cerr << "[Uyarı] Bilinmeyen Linux oturum türü: '" << session_type_str << "'" << std::endl; }
 
         if (proceed_to_execute && argv_list != nullptr && argv_list[0] != nullptr) {
+
+            // --- YENİ DEBUG KODU: Ortam Değişkenlerini Kontrol Et ---
+            const char* wayland_display_env = getenv("WAYLAND_DISPLAY");
+            const char* xdg_runtime_dir_env = getenv("XDG_RUNTIME_DIR");
+            std::cout << "[DEBUG_ENV] WAYLAND_DISPLAY=" << (wayland_display_env ? wayland_display_env : "YOK") << std::endl;
+            std::cout << "[DEBUG_ENV] XDG_RUNTIME_DIR=" << (xdg_runtime_dir_env ? xdg_runtime_dir_env : "YOK") << std::endl;
+            // --- DEBUG KODU SONU ---
+
             std::cout << "[Bilgi] '" << command_to_run_str << "' fork/execvp ile deneniyor..." << std::endl;
             pid_t pid = fork();
             if (pid == -1) { perror("[HATA] fork başarısız"); result = -1; }
@@ -313,17 +333,19 @@ void vnc_control_downlink_thread_func(int local_vnc_fd, int sock_to_relay, std::
         std::cout << "[VNC Downlink(B)] Thread sonlandırıldı." << std::endl;
     }
 }
+
 void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_running_ref, std::mutex& c_mutex_ref) {
+    
+    // --- 1. Başlatma ve Kurulum ---
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[VNC Downlink] Thread başlatıldı. Relay (Soket: " << sock_to_relay << ") dinleniyor." << std::endl;
-        std::cout << "[VNC Lib] libVNCclient başlatılıyor..." << std::endl;
+        std::cout << "[VNC Downlink] Thread başlatıldı. Görüntüleyici hazırlanıyor..." << std::endl;
     }
 
-    rfbClient* client = rfbGetClient(8,3,4);
+    rfbClient* client = rfbGetClient(8, 3, 4);
     if (!client) {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cerr << "[VNC Lib HATA] rfbGetClient başarısız!" << std::endl;
+        std::cerr << "[HATA] rfbGetClient belleği ayrılamadı!" << std::endl;
         return;
     }
 
@@ -333,106 +355,161 @@ void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_runni
     client->canHandleNewFBSize = TRUE;
     client->sock = sock_to_relay;
 
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[DEBUG_SDL] Adım 1: VNC bağlantısı başlatılıyor (InitialiseRFBConnection)..." << std::endl;
+    }
+
     if (!InitialiseRFBConnection(client)) {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cerr << "[VNC Lib HATA] InitialiseRFBConnection başarısız!" << std::endl;
+        std::cerr << "[VNC Lib HATA] InitialiseRFBConnection başarısız oldu!" << std::endl;
+        std::cerr << "[DEBUG_SDL] HATA: VNC bağlantısı kurulamadığı için Adım 1'de çıkıldı." << std::endl;
         rfbClientCleanup(client);
         return;
     }
 
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[VNC Lib] Bağlantı başlatıldı (InitialiseRFBConnection başarılı)." << std::endl;
-        std::cout << "[VNC Lib] Anlaşılan RFB versiyonu: " << (int)client->major << "." << (int)client->minor << std::endl;
-        std::cout << "[VNC Lib] Masaüstü Adı: " << (client->desktopName ? client->desktopName : "(yok)") << std::endl;
-        std::cout << "[VNC Lib] Framebuffer: " << client->width << "x" << client->height << std::endl;
+        std::cout << "[DEBUG_SDL] Adım 2: SDL başlatılıyor (SDL_Init)..." << std::endl;
     }
-
-    // --- YENİ KISIM: SDL Penceresi Oluşturma ---
+    
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
         std::cerr << "[SDL HATA] SDL başlatılamadı: " << SDL_GetError() << std::endl;
+        std::cerr << "[DEBUG_SDL] HATA: Adım 2'de çıkıldı." << std::endl;
         rfbClientCleanup(client);
         return;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[DEBUG_SDL] Adım 3: SDL Penceresi oluşturuluyor (SDL_CreateWindow)..." << std::endl;
+    }
+
     SDL_Window* window = SDL_CreateWindow(
-        (std::string("Uzak Masaüstü: ") + (client->desktopName ? client->desktopName : "")).c_str(), // Pencere başlığı
-        SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, // Pencere konumu
-        client->width, client->height, // Boyutlar libVNCclient'ten
-        SDL_WINDOW_SHOWN // Pencere gösterilsin
+        (std::string("Uzak Masaüstü: ") + (client->desktopName ? client->desktopName : "")).c_str(),
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        client->width, client->height,
+        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
     );
 
     if (!window) {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
         std::cerr << "[SDL HATA] Pencere oluşturulamadı: " << SDL_GetError() << std::endl;
+        std::cerr << "[DEBUG_SDL] HATA: Adım 3'te çıkıldı." << std::endl;
         SDL_Quit();
         rfbClientCleanup(client);
         return;
     }
     
-    // Şimdilik sadece boş bir pencere açıyoruz.
-    // Sonraki adımda renderer ve texture oluşturup framebuffer'ı çizeceğiz.
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[DEBUG_SDL] Adım 4: SDL Renderer oluşturuluyor (SDL_CreateRenderer)..." << std::endl;
+    }
 
-    // --- Ana Olay ve Mesaj Döngüsü ---
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cerr << "[SDL HATA] Renderer oluşturulamadı: " << SDL_GetError() << std::endl;
+        std::cerr << "[DEBUG_SDL] HATA: Adım 4'te çıkıldı." << std::endl;
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        rfbClientCleanup(client);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[DEBUG_SDL] Adım 5: SDL Texture oluşturuluyor (SDL_CreateTexture)..." << std::endl;
+    }
+
+    SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, 
+                                             SDL_TEXTUREACCESS_STREAMING, client->width, client->height);
+    if (!texture) {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cerr << "[SDL HATA] Texture oluşturulamadı: " << SDL_GetError() << std::endl;
+        std::cerr << "[DEBUG_SDL] HATA: Adım 5'te çıkıldı." << std::endl;
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        rfbClientCleanup(client);
+        return;
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[DEBUG_SDL] Adım 6: Kurulum tamamlandı. Ana döngüye giriliyor..." << std::endl;
+    }
+
+    // --- Ana Olay ve Görüntüleme Döngüsü ---
     SDL_Event event;
-    while (app_is_running_ref) {
-        // 1. SDL olaylarını işle (kullanıcının pencereyi kapatması gibi)
+    while (app_is_running_ref.load()) {
+        
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
-                {
-                    std::lock_guard<std::mutex> lock(c_mutex_ref);
-                    std::cout << "[SDL Bilgi] Pencere kapatma isteği alındı. Program sonlandırılıyor." << std::endl;
-                }
-                app_is_running_ref = false; // Ana programın kapanmasını tetikle
+                app_is_running_ref = false;
+            } 
+            else if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
+                SendPointerEvent(client, event.motion.x, event.motion.y, SDL_GetMouseState(NULL, NULL));
+            } 
+            else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
+                SendKeyEvent(client, event.key.keysym.sym, (event.type == SDL_KEYDOWN));
             }
-            // TODO (Adım 2a): Klavye ve fare olaylarını burada yakalayacağız.
         }
 
-        // 2. VNC soketinde okunacak veri var mı diye kontrol et (engellemesiz)
         fd_set fds;
-        struct timeval tv;
-        int ret;
-
         FD_ZERO(&fds);
         FD_SET(client->sock, &fds);
-        tv.tv_sec = 0; // Bekleme yapma
-        tv.tv_usec = 1000; // 1 milisaniye timeout (çok kısa)
+        struct timeval tv = {0, 5000}; // 5ms timeout
 
-        ret = select(client->sock + 1, &fds, NULL, NULL, &tv);
-        if (ret == -1) {
-            std::lock_guard<std::mutex> lock(c_mutex_ref);
-            perror("[VNC Downlink HATA] select() hatası");
-            app_is_running_ref = false; // Ciddi hata, çık
-        } else if (ret > 0) { // Sokette okunacak veri var
-            int result = HandleRFBServerMessage(client); // Veriyi işle
-            if (result <= 0) {
-                 std::lock_guard<std::mutex> lock(c_mutex_ref);
-                 if (result < 0) { std::cerr << "[VNC Lib HATA] HandleRFBServerMessage hata verdi." << std::endl; }
-                 else { std::cout << "[VNC Lib] Sunucu bağlantısı kapandı." << std::endl; }
-                 app_is_running_ref = false; // Bağlantı koptu, çık
+        if (select(client->sock + 1, &fds, NULL, NULL, &tv) > 0) {
+            if (HandleRFBServerMessage(client) <= 0) {
+                 app_is_running_ref = false; // Bağlantı koptu veya hata
             }
         }
-        // Eğer ret == 0 ise, timeout oldu, okunacak veri yok. Döngü devam eder.
 
-        // 3. Ekrana çizim yap (şimdilik sadece arkaplanı temizle)
-        // Sonraki adımda buraya texture çizimi gelecek.
-
-        // Kısa bir bekleme (CPU'yu %100 kullanmamak için)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (g_new_frame_ready.load()) {
+            g_new_frame_ready = false; 
+            if (g_vnc_framebuffer_storage.size() >= (size_t)client->width * client->height * 4) {
+                 int pitch = client->width * 4; // 32 bpp = 4 bytes
+                 SDL_UpdateTexture(texture, NULL, g_vnc_framebuffer_storage.data(), pitch);
+                 SDL_RenderClear(renderer);
+                 SDL_RenderCopy(renderer, texture, NULL, NULL);
+                 SDL_RenderPresent(renderer);
+            }
+        }
     }
 
     // --- Temizlik ---
-    if (window) {
-        SDL_DestroyWindow(window);
-    }
-    SDL_Quit();
-    rfbClientCleanup(client);
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[VNC Downlink] Thread sonlandırıldı (SDL ve libVNCclient temizlendi)." << std::endl;
+        std::cout << "[VNC Downlink] Thread sonlandırılıyor, kaynaklar temizleniyor..." << std::endl;
+    }
+
+    if (texture) SDL_DestroyTexture(texture);
+    if (renderer) SDL_DestroyRenderer(renderer);
+    if (window) SDL_DestroyWindow(window);
+    
+    SDL_Quit();
+    rfbClientCleanup(client);
+
+    {
+        std::lock_guard<std::mutex> lock(c_mutex_ref);
+        std::cout << "[VNC Downlink] Thread başarıyla sonlandırıldı." << std::endl;
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // Sunucudan Gelen Mesajları İşleyen Ana Fonksiyon
