@@ -1,52 +1,30 @@
-# Kullanılacak C++ derleyicisi
+# Derleyici ve bayraklar
 CXX = g++
+CXXFLAGS = -std=c++17 -Wall -g
 
-# Derleyici bayrakları:
-# -std=c++17 : C++17 standardını kullan
-# -Iinclude  : Başlık dosyaları için 'include' klasörünü ekle
-# -Wall      : Tüm uyarıları göster
-# -g         : Hata ayıklama bilgilerini ekle (isteğe bağlı)
-CXXFLAGS = -std=c++17 -Iinclude -Wall -g
+# Hedef program isimleri
+PAYLASAN_EXEC = paylasan
+GORUNTULEYICI_EXEC = goruntuleyici
 
-# Linker bayrakları (Kütüphaneler buraya eklenir)
-LDFLAGS = -pthread -lvncclient -lSDL2 -lpthread # <--- DEĞİŞİKLİK BURADA
+# Kütüphane bayrakları
+LDFLAGS_PAYLASAN = -pthread
+LDFLAGS_GORUNTULEYICI = -pthread -lSDL2 -lSDL2_image
 
-# Çalıştırılabilir dosyanın adı
-TARGET = program
+# Kaynak dosyalar
+PAYLASAN_SRC = src/istemci_paylasan.cpp
+GORUNTULEYICI_SRC = src/istemci_goruntuleyici.cpp
 
-# Kaynak, başlık ve nesne dosyası dizinleri
-SRCDIR = src
-INCDIR = include
-OBJDIR = obj
+all: $(PAYLASAN_EXEC) $(GORUNTULEYICI_EXEC)
 
-# Kaynak dosyaları otomatik bul (*.cpp)
-SOURCES := $(wildcard $(SRCDIR)/*.cpp)
+$(PAYLASAN_EXEC): $(PAYLASAN_SRC)
+	$(CXX) $(CXXFLAGS) -o $(PAYLASAN_EXEC) $(PAYLASAN_SRC) $(LDFLAGS_PAYLASAN)
+	@echo "Build finished: $(PAYLASAN_EXEC)"
 
-# Nesne dosyalarını oluştur (obj/ dosyasında)
-OBJECTS := $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SOURCES))
+$(GORUNTULEYICI_EXEC): $(GORUNTULEYICI_SRC)
+	$(CXX) $(CXXFLAGS) -o $(GORUNTULEYICI_EXEC) $(GORUNTULEYICI_SRC) $(LDFLAGS_GORUNTULEYICI)
+	@echo "Build finished: $(GORUNTULEYICI_EXEC)"
 
-# Varsayılan hedef: Çalıştırılabilir dosyayı oluştur
-all: $(TARGET)
-
-# Çalıştırılabilir dosyayı oluşturma kuralı
-# Nesne dosyalarını birbirine bağlar
-$(TARGET): $(OBJECTS)
-	@echo "Linking..."
-	# @mkdir -p $(dir $@) # 'program' ana dizinde olacağı için bu satıra gerek yok.
-	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS) # <--- DEĞİŞİKLİK BURADA (LDFLAGS eklendi)
-	@echo "Build finished: $(TARGET)"
-
-# Nesne dosyalarını derleme kuralı (*.cpp -> obj/*.o)
-$(OBJDIR)/%.o: $(SRCDIR)/%.cpp
-	@mkdir -p $(dir $@) # Nesne dosyası için obj dizinini oluştur
-	@echo "Compiling $<..."
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-# Temizleme kuralı: Oluşturulan dosyaları siler
 clean:
-	@echo "Cleaning up..."
-	rm -rf $(OBJDIR) $(TARGET)
-	@echo "Cleanup complete."
+	rm -f $(PAYLASAN_EXEC) $(GORUNTULEYICI_EXEC)
 
-# Dosya olmayan hedefleri belirtir
 .PHONY: all clean

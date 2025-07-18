@@ -160,19 +160,20 @@ void start_vnc_server() {
         std::cout << "[Bilgi] Oturum Türü (XDG_SESSION_TYPE): " << session_type_str << std::endl;
 
        
-              if (session_type_str == "wayland") {
-                command_to_run_str = "/bin/bash"; 
-                
-                if (command_exists("wayvnc")) { // Kontrol hala wayvnc için yapılıyor
-                    std::cout << "[Bilgi] 'wayvnc' bulundu. /bin/bash aracılığıyla başlatılacak..." << std::endl;
 
-                    // --- DEĞİŞİKLİK BURADA: Argüman listesini /bin/bash için hazırlıyoruz ---
-                    // "/bin/bash", "-c", "wayvnc", NULL
-                    // -c parametresi, bash'e tırnak içindeki komutu çalıştırmasını söyler.
+            if (session_type_str == "wayland") {
+                command_to_run_str = "/bin/bash"; 
+                if (command_exists("wayvnc")) {
+                    std::cout << "[Bilgi] 'wayvnc' bulundu. /bin/bash aracılığıyla ve loglama ile başlatılacak..." << std::endl;
+
+                    // --- DEĞİŞİKLİK BURADA: wayvnc'nin çıktısını dosyaya yönlendiriyoruz ---
+                    // Bu komut, wayvnc'nin tüm normal ve hata çıktılarını /tmp/wayvnc_log.txt dosyasına yazacak.
+                    const char* wayvnc_command_with_log = "wayvnc > /tmp/wayvnc_log.txt 2>&1";
+                    
                     argv_list = new char*[4];
                     argv_list[0] = strdup("/bin/bash");
                     argv_list[1] = strdup("-c");
-                    argv_list[2] = strdup("wayvnc");
+                    argv_list[2] = strdup(wayvnc_command_with_log);
                     argv_list[3] = NULL;
                     // --- DEĞİŞİKLİK SONU ---
 
@@ -180,8 +181,7 @@ void start_vnc_server() {
                 } else {
                     std::cerr << "[HATA] 'wayvnc' komutu bulunamadı! Lütfen kurun." << std::endl;
                 }
-            }
-            else if (session_type_str == "x11") {
+            }            else if (session_type_str == "x11") {
             command_to_run_str = "x11vnc";
             if (command_exists(command_to_run_str)) {
                 std::cout << "[Bilgi] 'x11vnc' bulundu. Argümanlar hazırlanıyor..." << std::endl;
@@ -334,20 +334,15 @@ void vnc_control_downlink_thread_func(int local_vnc_fd, int sock_to_relay, std::
     }
 }
 
+// Lütfen bu fonksiyonu eskisinin yerine tamamen kopyalayın
 void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_running_ref, std::mutex& c_mutex_ref) {
-    
-    // --- 1. Başlatma ve Kurulum ---
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
         std::cout << "[VNC Downlink] Thread başlatıldı. Görüntüleyici hazırlanıyor..." << std::endl;
     }
 
     rfbClient* client = rfbGetClient(8, 3, 4);
-    if (!client) {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cerr << "[HATA] rfbGetClient belleği ayrılamadı!" << std::endl;
-        return;
-    }
+    if (!client) { /* Hata yönetimi */ return; }
 
     client->MallocFrameBuffer = AllocFrameBuffer;
     client->GotFrameBufferUpdate = GotFrameBufferUpdate;
@@ -355,161 +350,113 @@ void vnc_downlink_thread_func(int sock_to_relay, std::atomic<bool>& app_is_runni
     client->canHandleNewFBSize = TRUE;
     client->sock = sock_to_relay;
 
-    {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[DEBUG_SDL] Adım 1: VNC bağlantısı başlatılıyor (InitialiseRFBConnection)..." << std::endl;
-    }
+    // --- DOĞRU EL SIKIŞMA MANTIĞI ---
 
-    if (!InitialiseRFBConnection(client)) {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cerr << "[VNC Lib HATA] InitialiseRFBConnection başarısız oldu!" << std::endl;
-        std::cerr << "[DEBUG_SDL] HATA: VNC bağlantısı kurulamadığı için Adım 1'de çıkıldı." << std::endl;
+    // Adım 1: Önce sunucunun 12 byte'lık versiyon mesajını dinleyip okuyoruz.
+    // Bu, protokolün doğru başlaması için kritik öneme sahiptir.
+    char server_version[13] = {0};
+    if (ReadFromRFBServer(client, server_version, 12) <= 0) {
+        {
+            std::lock_guard<std::mutex> lock(c_mutex_ref);
+            std::cerr << "VNC HATA: Sunucu versiyonu okunamadı veya bağlantı kapandı." << std::endl;
+        }
         rfbClientCleanup(client);
         return;
     }
-
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[DEBUG_SDL] Adım 2: SDL başlatılıyor (SDL_Init)..." << std::endl;
+        // Gelen mesajı null-terminated string'e çevirip yazdırıyoruz.
+        server_version[12] = '\0';
+        std::cout << "[VNC El Sıkışma] Sunucudan gelen versiyon: " << server_version;
     }
     
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cerr << "[SDL HATA] SDL başlatılamadı: " << SDL_GetError() << std::endl;
-        std::cerr << "[DEBUG_SDL] HATA: Adım 2'de çıkıldı." << std::endl;
+    // Adım 2: Sunucunun versiyonunu başarıyla okuduktan sonra, kendi versiyonumuzu gönderiyoruz.
+    if (!WriteToRFBServer(client, (char*)"RFB 003.008\n", 12)) {
+        std::cerr << "VNC HATA: İstemci versiyonu gönderilemedi." << std::endl;
         rfbClientCleanup(client);
         return;
     }
-
-    {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[DEBUG_SDL] Adım 3: SDL Penceresi oluşturuluyor (SDL_CreateWindow)..." << std::endl;
-    }
-
-    SDL_Window* window = SDL_CreateWindow(
-        (std::string("Uzak Masaüstü: ") + (client->desktopName ? client->desktopName : "")).c_str(),
-        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        client->width, client->height,
-        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
-    );
-
-    if (!window) {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cerr << "[SDL HATA] Pencere oluşturulamadı: " << SDL_GetError() << std::endl;
-        std::cerr << "[DEBUG_SDL] HATA: Adım 3'te çıkıldı." << std::endl;
-        SDL_Quit();
-        rfbClientCleanup(client);
-        return;
-    }
+    // --- DOĞRU EL SIKIŞMA MANTIĞI SONU ---
     
-    {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[DEBUG_SDL] Adım 4: SDL Renderer oluşturuluyor (SDL_CreateRenderer)..." << std::endl;
-    }
 
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-    if (!renderer) {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cerr << "[SDL HATA] Renderer oluşturulamadı: " << SDL_GetError() << std::endl;
-        std::cerr << "[DEBUG_SDL] HATA: Adım 4'te çıkıldı." << std::endl;
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        rfbClientCleanup(client);
-        return;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[DEBUG_SDL] Adım 5: SDL Texture oluşturuluyor (SDL_CreateTexture)..." << std::endl;
-    }
-
-    SDL_Texture* texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, 
-                                             SDL_TEXTUREACCESS_STREAMING, client->width, client->height);
-    if (!texture) {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cerr << "[SDL HATA] Texture oluşturulamadı: " << SDL_GetError() << std::endl;
-        std::cerr << "[DEBUG_SDL] HATA: Adım 5'te çıkıldı." << std::endl;
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(window);
-        SDL_Quit();
-        rfbClientCleanup(client);
-        return;
-    }
-    
-    {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[DEBUG_SDL] Adım 6: Kurulum tamamlandı. Ana döngüye giriliyor..." << std::endl;
-    }
+    // SDL değişkenleri
+    SDL_Window* window = nullptr;
+    SDL_Renderer* renderer = nullptr;
+    SDL_Texture* texture = nullptr;
+    bool sdl_initialised = false; 
 
     // --- Ana Olay ve Görüntüleme Döngüsü ---
     SDL_Event event;
     while (app_is_running_ref.load()) {
         
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                app_is_running_ref = false;
-            } 
-            else if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
-                SendPointerEvent(client, event.motion.x, event.motion.y, SDL_GetMouseState(NULL, NULL));
-            } 
-            else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
-                SendKeyEvent(client, event.key.keysym.sym, (event.type == SDL_KEYDOWN));
-            }
-        }
-
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(client->sock, &fds);
-        struct timeval tv = {0, 5000}; // 5ms timeout
+        struct timeval tv = {0, 10000}; // 10ms timeout
 
         if (select(client->sock + 1, &fds, NULL, NULL, &tv) > 0) {
+            
+            // Artık kütüphanenin genel işleyicisini güvenle çağırabiliriz.
+            // Güvenlik ve masaüstü bilgilerini bu fonksiyon halledecek.
             if (HandleRFBServerMessage(client) <= 0) {
-                 app_is_running_ref = false; // Bağlantı koptu veya hata
+                app_is_running_ref = false; 
+                break;
+            }
+
+            // El sıkışmasının bittiğini `client->width` ile kontrol et
+            if (!sdl_initialised && client->width > 0) {
+                sdl_initialised = true;
+                {
+                    std::lock_guard<std::mutex> lock(c_mutex_ref);
+                    std::cout << "[VNC Bilgi] El sıkışma tamamlandı! SDL başlatılıyor..." << std::endl;
+                }
+                // Pencereyi ve diğer grafikleri oluştur
+                if (SDL_Init(SDL_INIT_VIDEO) < 0 ||
+                   !(window = SDL_CreateWindow("Uzak Masaüstü", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, client->width, client->height, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE)) ||
+                   !(renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED)) ||
+                   !(texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, client->width, client->height))) {
+                    
+                    std::cerr << "SDL HATA: " << SDL_GetError() << std::endl;
+                    app_is_running_ref = false;
+                    break;
+                }
             }
         }
 
-        if (g_new_frame_ready.load()) {
-            g_new_frame_ready = false; 
-            if (g_vnc_framebuffer_storage.size() >= (size_t)client->width * client->height * 4) {
-                 int pitch = client->width * 4; // 32 bpp = 4 bytes
-                 SDL_UpdateTexture(texture, NULL, g_vnc_framebuffer_storage.data(), pitch);
-                 SDL_RenderClear(renderer);
-                 SDL_RenderCopy(renderer, texture, NULL, NULL);
-                 SDL_RenderPresent(renderer);
+        if (sdl_initialised) {
+            while (SDL_PollEvent(&event)) {
+                if (event.type == SDL_QUIT) { app_is_running_ref = false; } 
+                else if (event.type == SDL_MOUSEMOTION || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP) {
+                    SendPointerEvent(client, event.motion.x, event.motion.y, SDL_GetMouseState(NULL, NULL));
+                } else if (event.type == SDL_KEYDOWN || event.type == SDL_KEYUP) {
+                    SendKeyEvent(client, event.key.keysym.sym, (event.type == SDL_KEYDOWN));
+                }
+            }
+            
+            if (g_new_frame_ready.load()) {
+                g_new_frame_ready = false;
+                if (texture && g_vnc_framebuffer_storage.size() >= (size_t)client->width * client->height * 4) {
+                    int pitch = client->width * 4;
+                    SDL_UpdateTexture(texture, NULL, g_vnc_framebuffer_storage.data(), pitch);
+                    SDL_RenderClear(renderer);
+                    SDL_RenderCopy(renderer, texture, NULL, NULL);
+                    SDL_RenderPresent(renderer);
+                }
             }
         }
-    }
+    } 
 
     // --- Temizlik ---
-    {
-        std::lock_guard<std::mutex> lock(c_mutex_ref);
-        std::cout << "[VNC Downlink] Thread sonlandırılıyor, kaynaklar temizleniyor..." << std::endl;
-    }
-
     if (texture) SDL_DestroyTexture(texture);
     if (renderer) SDL_DestroyRenderer(renderer);
     if (window) SDL_DestroyWindow(window);
-    
-    SDL_Quit();
+    if (sdl_initialised) { SDL_Quit(); }
     rfbClientCleanup(client);
-
     {
         std::lock_guard<std::mutex> lock(c_mutex_ref);
         std::cout << "[VNC Downlink] Thread başarıyla sonlandırıldı." << std::endl;
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 // Sunucudan Gelen Mesajları İşleyen Ana Fonksiyon
@@ -559,10 +506,8 @@ void process_server_message(const std::string& server_msg_line, std::string& my_
         std::string peer_id_a; ss >> peer_id_a; // Bu, istek yapan İstemci A'nın ID'si
         std::cout << "[Bilgi] ID '" << peer_id_a << "' ile BAĞLANTI KURULDU." << std::endl;
         
-        std::cout << "[DEBUG_PROCESS] start_vnc_server() çağrılmadan hemen önce." << std::endl;
-        start_vnc_server();
-        std::cout << "[DEBUG_PROCESS] start_vnc_server() çağrıldıktan hemen sonra." << std::endl;
-        
+        // start_vnc_server();
+
         const int VNC_START_DELAY_SECONDS = 3;
         std::cout << "[DEBUG_PROCESS] Yerel VNC sunucusunun başlaması için " << VNC_START_DELAY_SECONDS << " saniye bekleniyor..." << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(VNC_START_DELAY_SECONDS));
@@ -648,3 +593,4 @@ void process_server_message(const std::string& server_msg_line, std::string& my_
     std::cout << "> ";
     std::cout.flush();
 }
+
